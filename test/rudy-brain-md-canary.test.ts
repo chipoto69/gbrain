@@ -7,6 +7,10 @@ import {
   deriveBrainSlug,
   injectProvenance,
 } from '../scripts/rudy/brain-md-canary.ts';
+import {
+  readClaudeMcpConfig,
+  redactSecret,
+} from '../scripts/rudy/remote-mcp-canary.ts';
 import { resolveSchemaEmbeddingDim } from '../src/core/embedding-dim-check.ts';
 
 describe('rudy brain markdown canary', () => {
@@ -90,5 +94,25 @@ describe('rudy 384-dim embedding compatibility', () => {
     });
     expect(got.ok).toBe(false);
     if (!got.ok) expect(got.error).toContain('fixed 1536-dimensional vectors');
+  });
+});
+
+describe('rudy remote MCP canary', () => {
+  test('reads Claude MCP bearer config without leaking token', () => {
+    const root = mkdtempSync(join(tmpdir(), 'claude-json-'));
+    const file = join(root, 'claude.json');
+    writeFileSync(file, JSON.stringify({
+      mcpServers: {
+        gbrain: {
+          url: 'https://brain.example/mcp',
+          headers: { Authorization: 'Bearer secret-token-123' },
+        },
+      },
+    }));
+
+    const cfg = readClaudeMcpConfig(file);
+    expect(cfg.url).toBe('https://brain.example/mcp');
+    expect(cfg.token).toBe('secret-token-123');
+    expect(redactSecret(`token=${cfg.token}`, cfg.token)).toBe('token=[REDACTED]');
   });
 });

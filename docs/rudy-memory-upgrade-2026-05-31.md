@@ -83,3 +83,27 @@ The canary derives a `brain/...` slug, injects source provenance, writes through
 
 Do not treat `ingest_log` as proof of memory. A write is successful only when
 the page, chunks or explicit skip reason, and retrieval proof exist.
+
+## Immediate remote MCP plug-in path
+
+The existing Claude/Codex MCP entry can be used as the fast read/write surface
+for agents while direct local DB auth is repaired. Verify it without printing
+the bearer token:
+
+```bash
+bun scripts/rudy/remote-mcp-canary.ts \
+  --from-claude-json /Users/rudlord/.claude.json \
+  --server gbrain
+```
+
+Expected successful checks:
+
+- initialize handshake
+- `tools/list`
+- `get_stats`
+
+This route talks to the deployed Supabase Edge MCP endpoint and does not require
+the broken local `database_url`. It is suitable for MCP-equivalent operations
+such as search, query, get, put, tags, links, and timeline writes. It is not a
+replacement for host-side DB access when applying migrations, taking backups,
+running sync/import, or re-embedding.
