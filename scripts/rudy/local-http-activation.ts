@@ -192,10 +192,15 @@ function makeLocalConfig(base: RemoteMcpConfig, url: string): RemoteMcpConfig {
 async function waitForChildExit(child: ChildProcess): Promise<number> {
   return await new Promise(resolve => {
     child.once('exit', (code, signal) => {
-      if (typeof code === 'number') resolve(code);
-      else resolve(signal ? 0 : 1);
+      resolve(childExitCode(code, signal));
     });
   });
+}
+
+export function childExitCode(code: number | null, signal: NodeJS.Signals | null): number {
+  if (typeof code === 'number') return code;
+  if (signal === 'SIGINT' || signal === 'SIGTERM') return 0;
+  return 1;
 }
 
 function installSignalForwarding(child: ChildProcess): () => void {
@@ -245,9 +250,11 @@ if (import.meta.main) {
     }
 
     const bearerConfig = readClaudeMcpConfig(resolve(cli.claudeJson), cli.server);
+    const bootstrapToken = process.env.GBRAIN_ADMIN_BOOTSTRAP_TOKEN || randomBytes(36).toString('base64url');
+    redactionSecrets.push(bootstrapToken);
     const env = {
       ...process.env,
-      GBRAIN_ADMIN_BOOTSTRAP_TOKEN: process.env.GBRAIN_ADMIN_BOOTSTRAP_TOKEN || randomBytes(36).toString('base64url'),
+      GBRAIN_ADMIN_BOOTSTRAP_TOKEN: bootstrapToken,
     };
     const args = buildServeArgs({
       port: cli.port,

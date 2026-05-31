@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   buildPlan,
   buildServeArgs,
+  childExitCode,
   dbUrlSource,
   localMcpUrl,
   redactDbUrl,
@@ -66,5 +67,14 @@ describe('rudy local HTTP activation', () => {
     });
     expect(plan.execution_mode).toBe('keep-alive');
     expect(plan.warning).toBeUndefined();
+  });
+
+  test('reports unexpected child signals as failures', () => {
+    expect(childExitCode(0, null)).toBe(0);
+    expect(childExitCode(7, null)).toBe(7);
+    expect(childExitCode(null, 'SIGINT')).toBe(0);
+    expect(childExitCode(null, 'SIGTERM')).toBe(0);
+    expect(childExitCode(null, 'SIGSEGV')).toBe(1);
+    expect(childExitCode(null, null)).toBe(1);
   });
 });
