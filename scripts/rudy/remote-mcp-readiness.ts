@@ -85,6 +85,14 @@ export function extractToolNames(payloads: unknown[]): string[] {
   return normalizeToolNames(names);
 }
 
+export function extractNextCursor(payloads: unknown[]): string | undefined {
+  for (const payload of payloads) {
+    const cursor = (payload as any)?.result?.nextCursor;
+    if (typeof cursor === 'string' && cursor.length > 0) return cursor;
+  }
+  return undefined;
+}
+
 export function extractServerInfo(payloads: unknown[]): { name?: string; version?: string } {
   for (const payload of payloads) {
     const info = (payload as any)?.result?.serverInfo;
@@ -136,11 +144,10 @@ export async function expectedRemoteToolNames(): Promise<string[]> {
   );
 }
 
-async function rpcCall(
+async function rpcPost(
   config: RemoteMcpConfig,
-  id: number,
+  body: Record<string, unknown>,
   method: string,
-  params: Record<string, unknown> = {},
   timeoutMs = 20_000,
 ): Promise<RpcResult> {
   const controller = new AbortController();
@@ -153,12 +160,7 @@ async function rpcCall(
         'Accept': 'application/json, text/event-stream',
         'Authorization': `Bearer ${config.token}`,
       },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id,
-        method,
-        params,
-      }),
+      body: JSON.stringify(body),
       signal: controller.signal,
     });
     const text = redactSecret(await res.text(), config.token);
@@ -174,21 +176,79 @@ async function rpcCall(
   }
 }
 
+async function rpcCall(
+  config: RemoteMcpConfig,
+  id: number,
+  method: string,
+  params: Record<string, unknown> = {},
+  timeoutMs = 20_000,
+): Promise<RpcResult> {
+  return rpcPost(config, {
+    jsonrpc: '2.0',
+    id,
+    method,
+    params,
+  }, method, timeoutMs);
+}
+
+async function rpcNotify(
+  config: RemoteMcpConfig,
+  method: string,
+  params: Record<string, unknown> = {},
+  timeoutMs = 20_000,
+): Promise<void> {
+  await rpcPost(config, {
+    jsonrpc: '2.0',
+    method,
+    params,
+  }, method, timeoutMs);
+}
+
+async function listToolsWithPagination(
+  config: RemoteMcpConfig,
+  startId: number,
+  timeoutMs: number,
+): Promise<{ toolNames: string[]; redactedText: string; nextId: number }> {
+  const toolNames: string[] = [];
+  const responseTexts: string[] = [];
+  let cursor: string | undefined;
+  let id = startId;
+  for (let page = 0; page < 50; page++) {
+    const params = cursor ? { cursor } : {};
+    const list = await rpcCall(config, id++, 'tools/list', params, timeoutMs);
+    responseTexts.push(list.redactedText);
+    toolNames.push(...extractToolNames(list.payloads));
+    cursor = extractNextCursor(list.payloads);
+    if (!cursor) {
+      return {
+        toolNames: normalizeToolNames(toolNames),
+        redactedText: responseTexts.join('\n'),
+        nextId: id,
+      };
+    }
+  }
+  throw new Error('tools/list pagination exceeded 50 pages');
+}
+
 export async function buildReadinessReport(
   config: RemoteMcpConfig,
   opts: { requiredTools: string[]; timeoutMs: number },
 ): Promise<ReadinessReport> {
-  const init = await rpcCall(config, 1, 'initialize', {
+  let id = 1;
+  const init = await rpcCall(config, id++, 'initialize', {
     protocolVersion: '2025-03-26',
     capabilities: {},
     clientInfo: { name: 'gbrain-rudy-readiness', version: '1' },
   }, opts.timeoutMs);
   const server = extractServerInfo(init.payloads);
 
-  const list = await rpcCall(config, 2, 'tools/list', {}, opts.timeoutMs);
-  const remoteTools = extractToolNames(list.payloads);
+  await rpcNotify(config, 'notifications/initialized', {}, opts.timeoutMs).catch(() => undefined);
+
+  const listed = await listToolsWithPagination(config, id, opts.timeoutMs);
+  id = listed.nextId;
+  const remoteTools = listed.toolNames;
   if (remoteTools.length === 0) {
-    throw new Error(`tools/list returned no parseable tools: ${list.redactedText.slice(0, 500)}`);
+    throw new Error(`tools/list returned no parseable tools: ${listed.redactedText.slice(0, 500)}`);
   }
 
   const comparison = compareToolSurface(remoteTools, await expectedRemoteToolNames(), opts.requiredTools);
@@ -196,7 +256,7 @@ export async function buildReadinessReport(
   let statsOk = false;
   let healthOk = false;
   try {
-    const stats = await rpcCall(config, 3, 'tools/call', {
+    const stats = await rpcCall(config, id++, 'tools/call', {
       name: 'get_stats',
       arguments: {},
     }, opts.timeoutMs);
@@ -205,7 +265,7 @@ export async function buildReadinessReport(
     statsOk = false;
   }
   try {
-    const health = await rpcCall(config, 4, 'tools/call', {
+    const health = await rpcCall(config, id++, 'tools/call', {
       name: 'get_health',
       arguments: {},
     }, opts.timeoutMs);
@@ -254,14 +314,20 @@ function parseCli(argv: string[]): {
   const requiredTools: string[] = [...DEFAULT_REQUIRED_TOOLS];
   let strictFullSurface = false;
 
+  const readValue = (flag: string, i: number): string => {
+    const value = argv[i + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+    return value;
+  };
+
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === '--url') url = argv[++i];
-    else if (arg === '--token-env') tokenEnv = argv[++i];
-    else if (arg === '--from-claude-json') claudeJson = argv[++i];
-    else if (arg === '--server') server = argv[++i];
-    else if (arg === '--timeout-ms') timeoutMs = Number(argv[++i]);
-    else if (arg === '--require-tool') requiredTools.push(argv[++i]);
+    if (arg === '--url') url = readValue(arg, i++);
+    else if (arg === '--token-env') tokenEnv = readValue(arg, i++);
+    else if (arg === '--from-claude-json') claudeJson = readValue(arg, i++);
+    else if (arg === '--server') server = readValue(arg, i++);
+    else if (arg === '--timeout-ms') timeoutMs = Number(readValue(arg, i++));
+    else if (arg === '--require-tool') requiredTools.push(readValue(arg, i++));
     else if (arg === '--strict-full-surface') strictFullSurface = true;
     else if (arg === '--help' || arg === '-h') {
       console.log(`Usage: bun scripts/rudy/remote-mcp-readiness.ts [--from-claude-json PATH] [--server gbrain]
@@ -278,6 +344,8 @@ Options:
   --strict-full-surface    Exit non-zero unless remote exposes every local HTTP-safe tool
   --timeout-ms N           Per-request timeout (default: 20000)`);
       process.exit(0);
+    } else {
+      throw new Error(`Unknown argument: ${arg}`);
     }
   }
 

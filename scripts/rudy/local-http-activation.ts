@@ -133,16 +133,22 @@ function parseCli(argv: string[]): {
   let timeoutMs = 30_000;
   let keepAlive = false;
 
+  const readValue = (flag: string, i: number): string => {
+    const value = argv[i + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value`);
+    return value;
+  };
+
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--execute') execute = true;
     else if (arg === '--keep-alive') keepAlive = true;
-    else if (arg === '--port') port = Number(argv[++i]);
-    else if (arg === '--bind') bind = argv[++i];
-    else if (arg === '--public-url') publicUrl = argv[++i];
-    else if (arg === '--from-claude-json') claudeJson = argv[++i];
-    else if (arg === '--server') server = argv[++i];
-    else if (arg === '--timeout-ms') timeoutMs = Number(argv[++i]);
+    else if (arg === '--port') port = Number(readValue(arg, i++));
+    else if (arg === '--bind') bind = readValue(arg, i++);
+    else if (arg === '--public-url') publicUrl = readValue(arg, i++);
+    else if (arg === '--from-claude-json') claudeJson = readValue(arg, i++);
+    else if (arg === '--server') server = readValue(arg, i++);
+    else if (arg === '--timeout-ms') timeoutMs = Number(readValue(arg, i++));
     else if (arg === '--help' || arg === '-h') {
       console.log(`Usage: bun scripts/rudy/local-http-activation.ts [--execute]
 
@@ -164,6 +170,8 @@ Options:
 Set GBRAIN_DATABASE_URL to a valid Supabase Postgres URL before --execute.
 The script redacts secrets and does not write ~/.gbrain/config.json.`);
       process.exit(0);
+    } else {
+      throw new Error(`Unknown argument: ${arg}`);
     }
   }
 
@@ -249,7 +257,7 @@ if (import.meta.main) {
     child = spawn(process.execPath, args, {
       cwd: process.cwd(),
       env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      stdio: ['ignore', 'ignore', 'pipe'],
     });
 
     let stderr = '';
