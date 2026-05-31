@@ -381,6 +381,41 @@ function validateDimAgainstTouchpoint(
     };
   }
 
+  if (recipe.id === 'openai' && modelId === 'text-embedding-ada-002') {
+    if (requestedDims === undefined || requestedDims === 1536) {
+      return {
+        ok: true,
+        dim: 1536,
+        model: `${recipe.id}:${modelId}`,
+        provider: recipe.id,
+        recipeDefault: defaultDims,
+      };
+    }
+    return {
+      ok: false,
+      error:
+        `OpenAI ${modelId} emits fixed 1536-dimensional vectors; got ${requestedDims}.`,
+    };
+  }
+
+  if (recipe.id === 'openai' && !isOpenAITextEmbedding3Model(modelId)) {
+    if (requestedDims === undefined) {
+      return {
+        ok: false,
+        error:
+          `Custom OpenAI-compatible embedding model "${modelId}" requires explicit embedding_dimensions. ` +
+          `Set the known vector width in ~/.gbrain/config.json or pass --embedding-dimensions <N>.`,
+      };
+    }
+    return {
+      ok: true,
+      dim,
+      model: `${recipe.id}:${modelId}`,
+      provider: recipe.id,
+      recipeDefault: defaultDims,
+    };
+  }
+
   if (requestedDims !== undefined && requestedDims !== defaultDims) {
     // User asked for a non-default dim. Walk the precedence chain.
     const customDimOk = isCustomDimValidForProvider(recipe, modelId, requestedDims, dimsOptions);
