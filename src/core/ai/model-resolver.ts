@@ -2,11 +2,26 @@
  * Parse and validate `provider:model` strings against the recipe registry.
  */
 
-import type { ParsedModelId, Recipe, TouchpointKind, ChatTouchpoint, EmbeddingTouchpoint, ExpansionTouchpoint } from './types.ts';
+import type { ParsedModelId, Recipe, TouchpointKind, ChatTouchpoint, EmbeddingTouchpoint, ExpansionTouchpoint, RerankerTouchpoint } from './types.ts';
 import { getRecipe, RECIPES } from './recipes/index.ts';
 import { AIConfigError } from './errors.ts';
 
-/** Split "openai:text-embedding-3-large" into { providerId, modelId }. */
+/**
+ * Split "openai:text-embedding-3-large" or "openai/text-embedding-3-large"
+ * into { providerId, modelId }. Colon takes precedence so OpenRouter nested
+ * ids like "openrouter:anthropic/claude-sonnet-4-6" route as
+ * { providerId: 'openrouter', modelId: 'anthropic/claude-sonnet-4-6' }.
+ *
+ * v0.41.21.0: slash form added so users typing `anthropic/claude-sonnet-4-6`
+ * (the form OpenRouter recipes emit and CLI `--judge-model` accepts) reach
+ * the gateway successfully. Pre-fix the colon-only check threw at every
+ * gateway entry point (chat / embed / rerank), so a slash-form id passed
+ * pricing checks via splitProviderModelId in `src/core/model-id.ts` and
+ * then died here at the gateway resolver. Closes the end-to-end bug class.
+ *
+ * Bare names without ANY separator still throw — `claude-sonnet-4-6` alone
+ * doesn't tell us which provider to route through.
+ */
 export function parseModelId(id: string): ParsedModelId {
   if (!id || typeof id !== 'string') {
     throw new AIConfigError(
@@ -14,15 +29,23 @@ export function parseModelId(id: string): ParsedModelId {
       'Expected format: provider:model (e.g. openai:text-embedding-3-large)',
     );
   }
+  // Colon wins over slash (OpenRouter nested-id semantic).
   const colon = id.indexOf(':');
-  if (colon === -1) {
-    throw new AIConfigError(
-      `Model id "${id}" is missing a provider prefix.`,
-      'Use format provider:model, e.g. openai:text-embedding-3-large',
-    );
+  let sepIdx: number;
+  if (colon !== -1) {
+    sepIdx = colon;
+  } else {
+    const slash = id.indexOf('/');
+    if (slash === -1) {
+      throw new AIConfigError(
+        `Model id "${id}" is missing a provider prefix.`,
+        'Use format provider:model (preferred) or provider/model, e.g. openai:text-embedding-3-large',
+      );
+    }
+    sepIdx = slash;
   }
-  const providerId = id.slice(0, colon).trim().toLowerCase();
-  const modelId = id.slice(colon + 1).trim();
+  const providerId = id.slice(0, sepIdx).trim().toLowerCase();
+  const modelId = id.slice(sepIdx + 1).trim();
   if (!providerId || !modelId) {
     throw new AIConfigError(
       `Model id "${id}" has empty provider or model.`,
@@ -54,17 +77,40 @@ export function resolveRecipe(modelId: string): { parsed: ParsedModelId; recipe:
   return { parsed, recipe };
 }
 
-type KnownTouchpointKey = 'embedding' | 'expansion' | 'chat';
+type KnownTouchpointKey = 'embedding' | 'expansion' | 'chat' | 'reranker';
 
-function getTouchpoint(recipe: Recipe, touchpoint: TouchpointKind): EmbeddingTouchpoint | ExpansionTouchpoint | ChatTouchpoint | undefined {
-  if (touchpoint === 'embedding' || touchpoint === 'expansion' || touchpoint === 'chat') {
+function getTouchpoint(recipe: Recipe, touchpoint: TouchpointKind): EmbeddingTouchpoint | ExpansionTouchpoint | ChatTouchpoint | RerankerTouchpoint | undefined {
+  if (touchpoint === 'embedding' || touchpoint === 'expansion' || touchpoint === 'chat' || touchpoint === 'reranker') {
     return recipe.touchpoints[touchpoint as KnownTouchpointKey];
   }
   return undefined;
 }
 
-/** Assert the resolved recipe actually offers the requested touchpoint. */
-export function assertTouchpoint(recipe: Recipe, touchpoint: TouchpointKind, modelId: string): void {
+/**
+ * Assert the resolved recipe actually offers the requested touchpoint.
+ *
+ * @param extendedModels Per-gateway-instance Set of additional models the
+ *   user opted into via `cfg.chat_model` / `cfg.embedding_model` /
+ *   `cfg.expansion_model` / `models.default` / `models.tier.*`. When the
+ *   modelId is in this set, the native-recipe allowlist check is skipped
+ *   (the user explicitly chose this model via config — provider rejection
+ *   surfaces at HTTP call time, with a clear `model_not_found` from the
+ *   provider).
+ *
+ *   Default code paths (hardcoded model strings in source code) MUST NOT
+ *   pass this argument — typos in code still fail fast. Only config-derived
+ *   model selection extends the allowlist.
+ *
+ *   v0.31.12 — replaces the earlier plan to soften the validator from throw
+ *   to warn (which would have removed the fail-fast contract for chat/expand/
+ *   embed all three; per Codex F4/F5 in plan review).
+ */
+export function assertTouchpoint(
+  recipe: Recipe,
+  touchpoint: TouchpointKind,
+  modelId: string,
+  extendedModels?: ReadonlySet<string>,
+): void {
   const tp = getTouchpoint(recipe, touchpoint);
   if (!tp) {
     throw new AIConfigError(
@@ -80,6 +126,13 @@ export function assertTouchpoint(recipe: Recipe, touchpoint: TouchpointKind, mod
   if (supportedModels.length > 0 && !supportedModels.includes(modelId)) {
     // Non-fatal: providers like ollama/litellm accept arbitrary model ids. We only warn for native providers.
     if (recipe.tier === 'native') {
+      // v0.31.12 recipe-models merge: if the user opted into this model via
+      // config (cfg.chat_model, models.default, models.tier.*), skip the
+      // throw. The model goes to the provider; provider 404s surface as
+      // `model_not_found` via `gbrain models doctor`.
+      if (extendedModels && extendedModels.has(modelId)) {
+        return;
+      }
       throw new AIConfigError(
         `Model "${modelId}" is not listed for ${recipe.name} ${touchpoint}.`,
         `Known models: ${supportedModels.join(', ')}. Use one of these or add it to the recipe (or add an alias).`,

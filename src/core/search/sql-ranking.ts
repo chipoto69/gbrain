@@ -129,5 +129,138 @@ export function buildVisibilityClause(pageAlias: string, sourceAlias: string): s
   return `AND ${pageAlias}.deleted_at IS NULL AND NOT ${sourceAlias}.archived`;
 }
 
+// ============================================================
+// Per-page max-pool (T1 / D7) — single source of truth
+// ============================================================
+
+/**
+ * Build the `best_per_page` pooling CTE: collapse a chunk-grain candidate set
+ * to ONE row per page — the page's highest-scoring chunk.
+ *
+ * This is the per-page max-pool that `searchKeyword` always had and that
+ * `searchVector` was missing (the retrieval-maxpool incident: a page got
+ * represented by whichever chunk survived the candidate cut, not its best
+ * chunk). Both engines (postgres + pglite) AND both retrieval paths
+ * (keyword + vector) consume this one builder so they cannot drift — the
+ * recurring postgres/pglite parity bug class this repo guards against.
+ *
+ * Contract on the candidate CTE (`candidateCte`):
+ *   - exposes `source_id` + `slug` columns (the composite per-page collapse key)
+ *   - exposes a numeric `score` column (the value pooled on)
+ *   - exposes `page_id` and `chunk_id` columns (deterministic tiebreak)
+ *
+ * Collapse key is COMPOSITE `(source_id, slug)`, NOT slug alone — two pages
+ * with the same slug in different sources are distinct pages (the federated
+ * multi-source contract; matches dedup.ts's pageKey and the v0.34.1 source
+ * isolation seal). Pooling on bare slug would collapse them and drop the
+ * neighbor-source page before ranking. `COALESCE(source_id, 'default')` keeps
+ * pre-v0.17 single-source rows (null source_id) collapsing correctly.
+ *
+ * Determinism: `DISTINCT ON` keeps the FIRST row per key under the ORDER BY,
+ * so the tiebreak `… score DESC, page_id ASC, chunk_id ASC` makes the surviving
+ * chunk fully deterministic when two chunks of the same page tie on score
+ * (basis-vector eval fixtures, planner-independent — same rationale as the
+ * v0.41.13 searchVector stable tiebreaker).
+ *
+ * Pooling happens over the FULL candidate set (`innerLimit` rows) BEFORE the
+ * user-facing `LIMIT`, so a page's best chunk can't be truncated out by
+ * weaker chunks of OTHER pages occupying the early `LIMIT` slots — the vector
+ * path now returns N distinct pages (each by best chunk), not N chunks that
+ * collapse to fewer pages downstream.
+ *
+ * @param candidateCte — name of the upstream CTE to pool (e.g. `'hnsw_candidates'`,
+ *                        `'ranked_chunks'`). Engine-supplied identifier, never user input.
+ * @returns raw SQL fragment: `best_per_page AS ( ... )` (no trailing comma)
+ */
+export function buildBestPerPagePoolCte(candidateCte: string): string {
+  return `best_per_page AS (
+        SELECT DISTINCT ON (COALESCE(source_id, 'default'), slug) *
+        FROM ${candidateCte}
+        ORDER BY COALESCE(source_id, 'default'), slug, score DESC, page_id ASC, chunk_id ASC
+      )`;
+}
+
+// ============================================================
+// v0.29.1 — Recency component SQL builder
+// ============================================================
+
+/**
+ * Typed expression for "what NOW() should be" in the SQL. Tests pass
+ * `{ kind: 'fixed', isoUtc }` for deterministic output regardless of wall
+ * clock. Production callers leave it default (`{ kind: 'now' }`).
+ *
+ * The builder constructs the SQL literal internally via escapeSqlLiteral
+ * for the 'fixed' branch — caller-supplied strings NEVER flow into raw SQL,
+ * preventing the injection vector codex pass-1 #5 flagged.
+ */
+export type NowExpr = { kind: 'now' } | { kind: 'fixed'; isoUtc: string };
+
+function nowExprToSql(now: NowExpr): string {
+  if (now.kind === 'now') return 'NOW()';
+  return `'${escapeSqlLiteral(now.isoUtc)}'::timestamptz`;
+}
+
+/**
+ * Build the per-row recency component SQL fragment.
+ *
+ * For each prefix in the decay map, emit one CASE branch:
+ *   - halflifeDays = 0 (or coefficient = 0) → literal 0 (evergreen short-circuit)
+ *   - halflifeDays > 0  → coefficient * halflife / (halflife + days_old)
+ *
+ * Prefixes sorted longest-first so 'media/articles/' matches before 'media/'
+ * (mirror of buildSourceFactorCase's ordering).
+ *
+ * Output is a single SQL expression suitable for SELECT / ORDER BY.
+ *
+ * @param slugColumn — qualified column reference (engine-supplied, trusted)
+ * @param dateExpr   — qualified expression for the page's effective date
+ *                     (typically `COALESCE(p.effective_date, p.updated_at)`)
+ * @param decayMap   — per-prefix configurations (resolved from defaults +
+ *                     yaml + env + caller)
+ * @param fallback   — applied to slugs matching no prefix
+ * @param now        — typed NOW() expression (default `{ kind: 'now' }`)
+ */
+export function buildRecencyComponentSql(opts: {
+  slugColumn: string;
+  dateExpr: string;
+  decayMap: import('./recency-decay.ts').RecencyDecayMap;
+  fallback: import('./recency-decay.ts').RecencyDecayConfig;
+  now?: NowExpr;
+}): string {
+  const { slugColumn, dateExpr, decayMap, fallback } = opts;
+  const now = opts.now ?? { kind: 'now' };
+  const nowSql = nowExprToSql(now);
+  const daysOldSql = `EXTRACT(EPOCH FROM (${nowSql} - ${dateExpr})) / 86400.0`;
+
+  const prefixes = Object.keys(decayMap).sort((a, b) => b.length - a.length);
+  const branches: string[] = [];
+
+  for (const prefix of prefixes) {
+    const cfg = decayMap[prefix];
+    const literal = buildLikePrefixLiteral(prefix);
+    if (cfg.halflifeDays === 0 || cfg.coefficient === 0) {
+      branches.push(`WHEN ${slugColumn} LIKE ${literal} THEN 0`);
+    } else {
+      const h = cfg.halflifeDays;
+      const c = cfg.coefficient;
+      branches.push(
+        `WHEN ${slugColumn} LIKE ${literal} THEN ${c} * ${h}.0 / (${h}.0 + ${daysOldSql})`,
+      );
+    }
+  }
+
+  let elseSql: string;
+  if (fallback.halflifeDays === 0 || fallback.coefficient === 0) {
+    elseSql = '0';
+  } else {
+    const h = fallback.halflifeDays;
+    const c = fallback.coefficient;
+    elseSql = `${c} * ${h}.0 / (${h}.0 + ${daysOldSql})`;
+  }
+
+  if (branches.length === 0) return `(${elseSql})`;
+  return `(CASE ${branches.join(' ')} ELSE ${elseSql} END)`;
+}
+
 // Exported for unit tests
 export const __test__ = { escapeLikePattern, escapeSqlLiteral, buildLikePrefixLiteral };

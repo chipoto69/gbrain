@@ -15,12 +15,28 @@ export interface CliOptions {
   quiet: boolean;
   progressJson: boolean;
   progressInterval: number; // ms
+  /**
+   * v0.31.1 (Issue #734, ENG-4): user-supplied per-call timeout for thin-client
+   * routed MCP calls. `null` means "use the per-command default" (30s for most
+   * ops, 180s for `think`). When set, applies to every routed call in the
+   * current invocation.
+   */
+  timeoutMs: number | null;
+  /**
+   * v0.40.4 — `--explain` flag for `gbrain search/query`. Switches the
+   * default formatter to a per-stage attribution view that shows
+   * base_score + each boost stage's multiplier + rank delta from
+   * the reranker. Has no effect on other commands.
+   */
+  explain: boolean;
 }
 
 export const DEFAULT_CLI_OPTIONS: CliOptions = {
   quiet: false,
   progressJson: false,
   progressInterval: 1000,
+  timeoutMs: null,
+  explain: false,
 };
 
 /**
@@ -71,10 +87,55 @@ export function parseGlobalFlags(argv: string[]): { cliOpts: CliOptions; rest: s
       rest.push(a);
       continue;
     }
+    // v0.31.1: --timeout=Ns or --timeout Ns. Accepts plain ms, "30s", "2m".
+    if (a === '--timeout' && i + 1 < argv.length) {
+      const next = argv[i + 1];
+      const parsed = parseTimeout(next);
+      if (parsed !== null) {
+        cliOpts.timeoutMs = parsed;
+        i++;
+        continue;
+      }
+      rest.push(a);
+      continue;
+    }
+    if (a.startsWith('--timeout=')) {
+      const val = a.slice('--timeout='.length);
+      const parsed = parseTimeout(val);
+      if (parsed !== null) {
+        cliOpts.timeoutMs = parsed;
+        continue;
+      }
+      rest.push(a);
+      continue;
+    }
+    // v0.40.4 — --explain for `gbrain search/query` per-stage attribution.
+    if (a === '--explain') {
+      cliOpts.explain = true;
+      continue;
+    }
     rest.push(a);
   }
 
   return { cliOpts, rest };
+}
+
+/**
+ * v0.31.1: parse a timeout value. Accepts:
+ *   "30000" / "30000ms" → 30000
+ *   "30s"               → 30000
+ *   "2m"                → 120000
+ *   "1.5s"              → 1500
+ * Returns null on parse failure (caller decides whether to error or fall through).
+ */
+export function parseTimeout(s: string): number | null {
+  const m = /^([0-9]+(?:\.[0-9]+)?)(ms|s|m)?$/.exec(s.trim());
+  if (!m) return null;
+  const n = Number(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const unit = m[2] ?? 'ms';
+  const ms = unit === 'ms' ? n : unit === 's' ? n * 1000 : n * 60_000;
+  return Math.floor(ms);
 }
 
 function parseInterval(s: string): number | null {
@@ -144,4 +205,105 @@ export function childGlobalFlags(cliOpts?: CliOptions): string {
     parts.push(`--progress-interval=${opts.progressInterval}`);
   }
   return parts.length > 0 ? ' ' + parts.join(' ') : '';
+}
+
+// ============================================================
+// v0.36+ brain-health-100 wave: --background flag (D9 + T7)
+//
+// Per the locked decision: --background means submit-and-exit ALWAYS.
+// Same semantics in TTY and cron. Composable in shell pipelines:
+//
+//   JOB=$(gbrain embed --stale --background | grep -oE 'job_id=[0-9]+' | cut -d= -f2)
+//   gbrain jobs get $JOB
+//
+// `--background --follow` submits then execs `gbrain jobs follow <id>`
+// so the user sees live stream while still getting durable queue
+// semantics (worker survives if user disconnects).
+//
+// PGLite degrades to inline with a clear stderr note. NOT a no-op,
+// NOT silent. Doc-stated semantic difference because PGLite has no
+// worker daemon.
+// ============================================================
+
+import type { BrainEngine } from './engine.ts';
+import { createHash } from 'crypto';
+
+export interface MaybeBackgroundOpts {
+  engine: BrainEngine;
+  args: string[];
+  jobName: string;
+  paramBuilder: (args: string[]) => Record<string, unknown>;
+  /** Source id for the idempotency key namespace. Default 'cli'. */
+  source?: string;
+}
+
+/**
+ * If `--background` is in args, submit a Minion job and return true
+ * (caller should exit). Otherwise return false (caller does inline work).
+ *
+ * Strips `--background` and `--follow` from args before paramBuilder
+ * runs so the param shape stays clean. On submit failure, prints stderr
+ * + exits 1 (no orphan job; no silent fallthrough to inline).
+ *
+ * @returns true if backgrounded (caller MUST exit), false otherwise.
+ */
+export async function maybeBackground(opts: MaybeBackgroundOpts): Promise<boolean> {
+  if (!opts.args.includes('--background')) return false;
+
+  const filtered = opts.args.filter((a) => a !== '--background' && a !== '--follow');
+  const params = opts.paramBuilder(filtered);
+  const follow = opts.args.includes('--follow');
+  const source = opts.source ?? 'cli';
+
+  // PGLite has no worker daemon. Per the doc-stated semantics, degrade
+  // to inline with a clear stderr note rather than silently failing.
+  if (opts.engine.kind === 'pglite') {
+    process.stderr.write(
+      `[--background] PGLite has no worker daemon; running inline.\n`,
+    );
+    return false;  // caller runs inline
+  }
+
+  // D9: content-hash idempotency key. No time-slot — same intent = same
+  // key. Failed-row replay is the doctor --remediate loop's job, not
+  // the CLI --background path's job.
+  const idempotency_key = `${source}:${opts.jobName}:${sha8(canonicalJson(params))}`;
+
+  try {
+    const { MinionQueue } = await import('./minions/queue.ts');
+    const queue = new MinionQueue(opts.engine);
+    const job = await queue.add(opts.jobName, params, {
+      queue: 'default',
+      idempotency_key,
+      max_attempts: 2,
+    });
+    process.stdout.write(`job_id=${job.id}\n`);
+
+    if (follow) {
+      // exec `gbrain jobs follow <id>` so the user sees live stream
+      // without losing the durable-queue submission.
+      const { spawn } = await import('child_process');
+      const cmd = process.argv[0] ?? 'bun';
+      const script = process.argv[1] ?? '';
+      const child = spawn(cmd, [script, 'jobs', 'follow', String(job.id)], {
+        stdio: 'inherit',
+      });
+      await new Promise<void>((resolve) => child.on('exit', () => resolve()));
+    }
+    return true;  // caller exits
+  } catch (e) {
+    process.stderr.write(`[--background] submit failed: ${(e as Error).message}\n`);
+    process.exit(1);
+  }
+}
+
+function sha8(s: string): string {
+  return createHash('sha256').update(s).digest('hex').slice(0, 8);
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  const keys = Object.keys(value as Record<string, unknown>).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonicalJson((value as Record<string, unknown>)[k])}`).join(',')}}`;
 }

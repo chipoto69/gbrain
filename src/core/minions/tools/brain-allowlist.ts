@@ -26,6 +26,7 @@ import type { BrainEngine } from '../../engine.ts';
 import type { GBrainConfig } from '../../config.ts';
 import { operations } from '../../operations.ts';
 import type { Operation, OperationContext } from '../../operations.ts';
+import { paramDefToSchema } from '../../../mcp/tool-defs.ts';
 import type { ToolCtx, ToolDef } from '../types.ts';
 
 /**
@@ -56,7 +57,44 @@ export const BRAIN_TOOL_ALLOWLIST: ReadonlySet<string> = new Set([
   'resolve_slugs',
   'get_ingest_log',
   'put_page',
+  // v0.29 — Salience + Anomaly Detection. Both read-only. `get_recent_transcripts`
+  // is intentionally NOT included: subagent calls always have ctx.remote=true,
+  // and the v0.29 trust gate rejects remote callers — adding it here would be
+  // a footgun (subagent calls op, gets permission_denied, looks like a bug).
+  // The cycle synthesize phase already calls discoverTranscripts directly.
+  'get_recent_salience',
+  'find_anomalies',
 ]);
+
+/**
+ * v0.41 Approach C: per-tool usage_hint surfaced verbatim in the subagent
+ * system prompt's tool preamble. Each entry tells the model WHEN to reach
+ * for the tool (the description tells the model HOW). One line per tool;
+ * no embedded newlines.
+ *
+ * Field-report driver: the renderer in `src/core/minions/system-prompt.ts`
+ * surfaces these so a model with `shell` + brain tools in its registry
+ * knows brain tools write to the gbrain DB (NOT local files) and to reach
+ * for shell when the task asks for filesystem work.
+ *
+ * Keyed by OP name (pre-`brain_` prefix). Optional — tools without an entry
+ * just render as `- \`name\`` with no hint suffix.
+ */
+export const BRAIN_TOOL_USAGE_HINTS: Readonly<Record<string, string>> = {
+  query: 'Use for natural-language semantic search across the brain (vector + keyword hybrid). Returns ranked passages with citations. First choice when the user asks a question of the brain.',
+  search: 'Use for hybrid keyword + vector search returning ranked page hits. Use over `query` when you want page-level not chunk-level results (e.g. "find pages about X").',
+  get_page: 'Read a brain page by its slug. Returns the full markdown body + frontmatter + linked pages.',
+  list_pages: 'List pages by type or slug-prefix filter. Use when you need to enumerate (e.g. "list all `people/` pages") instead of search.',
+  file_list: 'List uploaded files (attachments) by slug-prefix or content type. NOT the local filesystem — only files the brain has stored.',
+  file_url: 'Get a presigned URL for a brain-stored file. Read-only; expires.',
+  get_backlinks: 'List every page that links TO the given slug. Use for "what references this".',
+  traverse_graph: 'Walk the typed-edge graph starting from a slug (e.g. `works_at`, `founded`, `invested_in`). Use for relationship queries.',
+  resolve_slugs: 'Resolve free-form entity names to canonical slugs (e.g. "Alice" → `people/alice-example`). Use before any tool that takes a slug if the user gave a name not a slug.',
+  get_ingest_log: 'Read the brain ingestion log for diagnostic / verification queries.',
+  put_page: 'Write a markdown page to the gbrain DATABASE (NOT the local filesystem). Page becomes searchable + linkable. Slug must match the agent\'s allowed namespace.',
+  get_recent_salience: 'Read pages ranked by emotional + activity salience over a recency window. Use for "what\'s been on my mind lately".',
+  find_anomalies: 'Read cohort-level activity outliers (e.g. tag-cohort or type-cohort with unusual recent volume). Use for "what\'s unusual lately".',
+};
 
 /** Matches Anthropic's tool-name constraint. No dots. */
 const ANTHROPIC_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
@@ -78,12 +116,7 @@ function paramsToInputSchema(op: Operation): Record<string, unknown> {
   return {
     type: 'object' as const,
     properties: Object.fromEntries(
-      Object.entries(op.params).map(([k, v]) => [k, {
-        type: v.type === 'array' ? 'array' : v.type,
-        ...(v.description ? { description: v.description } : {}),
-        ...(v.enum ? { enum: v.enum } : {}),
-        ...(v.items ? { items: { type: v.items.type } } : {}),
-      }]),
+      Object.entries(op.params).map(([k, v]) => [k, paramDefToSchema(v)]),
     ),
     required: Object.entries(op.params).filter(([, v]) => v.required).map(([k]) => k),
   };
@@ -179,6 +212,7 @@ function buildOpContext(deps: OpContextDeps): OperationContext {
     },
     dryRun: false,
     remote: true,                // match MCP trust boundary for auto-link skip
+    sourceId: 'default',         // v0.34 D4: required; subagent tools default to host source
     jobId: deps.jobId,
     subagentId: deps.subagentId,
     viaSubagent: true,           // FAIL-CLOSED: put_page etc. enforce namespace
@@ -219,6 +253,9 @@ export function buildBrainTools(opts: BuildBrainToolsOpts): ToolDef[] {
       // v0.15 ships only idempotent brain tools (every allow-listed op is
       // deterministic over its input; put_page re-writes the same slug).
       idempotent: true,
+      // v0.41 Approach C: surface usage_hint to the system-prompt renderer.
+      // Keyed by the unprefixed op name. Undefined when no hint is registered.
+      usage_hint: BRAIN_TOOL_USAGE_HINTS[op.name],
       async execute(input: unknown, ctx: ToolCtx): Promise<unknown> {
         const opCtx = buildOpContext({
           engine: ctx.engine,

@@ -1,8 +1,9 @@
 /**
- * HTTP transport for `gbrain serve --http`.
+ * HTTP transport for `gbrain serve --http` (legacy bearer-auth path).
  *
- * Postgres-only. PGLite users get a clear fail-fast at startup (the access_tokens
- * table doesn't exist on PGLite per pglite-schema.ts).
+ * Engine-aware via SqlQuery (works on both Postgres and PGLite as of the
+ * v0.31 wave). The access_tokens and mcp_request_log tables exist on both
+ * engines (see src/core/pglite-schema.ts:478,495 and src/schema.sql).
  *
  * Security model:
  *   - Every request must include `Authorization: Bearer <token>` (except /health)
@@ -31,6 +32,7 @@ import { operations } from '../core/operations.ts';
 import { VERSION } from '../version.ts';
 import { dispatchToolCall } from './dispatch.ts';
 import { buildDefaultLimiters, type RateLimiter } from './rate-limit.ts';
+import { sqlQueryForEngine } from '../core/sql-query.ts';
 
 const DEFAULT_BODY_CAP = 1024 * 1024; // 1 MiB
 
@@ -62,6 +64,16 @@ interface AuthResult {
   ok: boolean;
   tokenId?: string;
   tokenName?: string;
+  /** v0.28: per-token allow-list for takes.holder. Default ['world'] when permissions row absent. */
+  takesHoldersAllowList?: string[];
+  /**
+   * v0.34.1 (#861, D13): source-isolation scope for the auth'd request.
+   * Legacy bearer tokens here default to 'default' to match the v0.33
+   * effective behavior (the now-removed serve-http.ts fallback chain).
+   * Operators migrate to the full OAuth transport (gbrain serve --http)
+   * for narrower scoping.
+   */
+  sourceId?: string;
 }
 
 /** Read up to `cap` bytes off req.body. Returns null if cap exceeded. */
@@ -114,45 +126,48 @@ function resolveClientIp(req: Request, server: { requestIP: (r: Request) => { ad
 export async function startHttpTransport(opts: HttpTransportOptions) {
   const { port, engine } = opts;
 
-  // Fail-fast: HTTP transport requires Postgres because access_tokens / mcp_request_log
-  // only exist in the Postgres schema (see src/core/pglite-schema.ts:5-6).
-  if ((engine as { kind?: string }).kind !== 'postgres') {
-    console.error('Error: gbrain serve --http requires a Postgres engine for remote auth tokens.');
-    console.error('PGLite is local-only by design (access_tokens table is Postgres-only).');
-    console.error('Either:');
-    console.error('  - Use stdio: gbrain serve');
-    console.error('  - Migrate to Postgres: gbrain migrate --to supabase');
-    process.exit(1);
-  }
-
-  const sql = (engine as unknown as { sql: any }).sql;
-  if (!sql) {
-    console.error('Error: Postgres engine has no .sql client. Engine may not be connected.');
-    process.exit(1);
-  }
+  // Engine-aware: route SQL through the active BrainEngine. Both Postgres
+  // and PGLite carry access_tokens + mcp_request_log in their schemas
+  // (pglite-schema.ts:478,495 and schema.sql), so the legacy bearer-auth
+  // path works on either engine without a postgres.js singleton.
+  const sql = sqlQueryForEngine(engine);
 
   const limiters = opts.limiters || buildDefaultLimiters();
   const bodyCap = envInt('GBRAIN_HTTP_MAX_BODY_BYTES', DEFAULT_BODY_CAP);
   const corsAllowlist = parseCorsAllowlist();
   const tools = buildToolDefs(operations);
 
-  function corsHeaders(origin: string | null, extra: Record<string, string> = {}): Record<string, string> {
-    const headers: Record<string, string> = { ...extra };
-    if (corsAllowlist && origin && corsAllowlist.has(origin)) {
-      headers['Access-Control-Allow-Origin'] = origin;
-      headers['Vary'] = 'Origin';
-    }
-    return headers;
+  /**
+   * v0.41.3 (T6): single consolidated CORS header builder. Pre-fix there were
+   * two parallel functions (`corsHeaders` for actual requests, `corsPreflightHeaders`
+   * for OPTIONS) — the preflight variant unconditionally emitted
+   * `Access-Control-Allow-Methods` + `Access-Control-Allow-Headers` to EVERY
+   * Origin, leaking the API surface to attackers probing the preflight. The
+   * actual-request path was correctly default-deny.
+   *
+   * One function, one allowlist gate. Methods/Headers only emit when
+   * preflight=true AND origin is allowlisted. Allow-Origin emits only when
+   * origin is allowlisted (unchanged). `Vary: Origin` pairs with Allow-Origin
+   * so caches don't serve allowlisted responses to non-allowlisted requests.
+   *
+   * `extra` is for response-specific headers (Retry-After, etc.) and is
+   * never gated by the allowlist.
+   */
+  interface CorsHeaderOpts {
+    preflight?: boolean;
+    extra?: Record<string, string>;
   }
-
-  function corsPreflightHeaders(origin: string | null): Record<string, string> {
-    const headers: Record<string, string> = {
-      'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, Accept',
-    };
-    if (corsAllowlist && origin && corsAllowlist.has(origin)) {
+  function corsHeaders(origin: string | null, opts: CorsHeaderOpts = {}): Record<string, string> {
+    const { preflight = false, extra = {} } = opts;
+    const headers: Record<string, string> = { ...extra };
+    const allowed = corsAllowlist && origin && corsAllowlist.has(origin);
+    if (allowed) {
       headers['Access-Control-Allow-Origin'] = origin;
       headers['Vary'] = 'Origin';
+      if (preflight) {
+        headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS';
+        headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, Accept';
+      }
     }
     return headers;
   }
@@ -163,18 +178,37 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
     const hash = hashToken(token);
     try {
       const [row] = await sql`
-        SELECT id, name FROM access_tokens
+        SELECT id, name, permissions FROM access_tokens
         WHERE token_hash = ${hash} AND revoked_at IS NULL
       `;
       if (!row) return { ok: false };
+      const rowId = row.id as string;
+      const rowName = row.name as string;
       // Debounced last_used_at update — only writes once per token per 60s.
       // SQL-level WHERE clause keeps this race-tolerant even under concurrent requests.
       sql`UPDATE access_tokens
           SET last_used_at = now()
-          WHERE id = ${row.id}
+          WHERE id = ${rowId}
             AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')`
         .catch(() => { /* fire-and-forget */ });
-      return { ok: true, tokenId: row.id, tokenName: row.name };
+      // v0.28: extract per-token takes-holder allow-list. Fail-safe default
+      // is ['world'] — a token with no permissions row sees public claims only.
+      const perms = (row as { permissions?: { takes_holders?: unknown } }).permissions;
+      const allowList = Array.isArray(perms?.takes_holders)
+        ? (perms!.takes_holders as unknown[]).filter(h => typeof h === 'string') as string[]
+        : ['world'];
+      return {
+        ok: true,
+        tokenId: rowId,
+        tokenName: rowName,
+        takesHoldersAllowList: allowList,
+        // v0.34.1 (#861, D13): legacy bearer tokens default to 'default'
+        // source. Preserves the pre-v0.34 effective behavior of the
+        // serve-http fallback chain that was removed for OAuth clients
+        // (migration v60 backfills oauth_clients.source_id). This path
+        // is for the older v0.22.7 access_tokens transport.
+        sourceId: 'default',
+      };
     } catch {
       return { ok: false };
     }
@@ -196,7 +230,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
 
       // CORS preflight
       if (req.method === 'OPTIONS') {
-        return new Response(null, { headers: corsPreflightHeaders(origin) });
+        return new Response(null, { headers: corsHeaders(origin, { preflight: true }) });
       }
 
       // Health check — no auth, no rate limit. Probes the DB so orchestration
@@ -233,7 +267,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
           { error: 'rate_limited', message: 'Too many requests' },
           {
             status: 429,
-            headers: corsHeaders(origin, { 'Retry-After': String(ipCheck.retryAfter ?? 60) }),
+            headers: corsHeaders(origin, { extra: { 'Retry-After': String(ipCheck.retryAfter ?? 60) } }),
           },
         );
       }
@@ -266,7 +300,7 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
           { error: 'rate_limited', message: 'Too many requests for this token' },
           {
             status: 429,
-            headers: corsHeaders(origin, { 'Retry-After': String(tokCheck.retryAfter ?? 60) }),
+            headers: corsHeaders(origin, { extra: { 'Retry-After': String(tokCheck.retryAfter ?? 60) } }),
           },
         );
       }
@@ -320,7 +354,15 @@ export async function startHttpTransport(opts: HttpTransportOptions) {
       if (method === 'tools/call') {
         const toolName: string = params?.name ?? 'unknown';
         const args: Record<string, unknown> = params?.arguments ?? {};
-        const result = await dispatchToolCall(engine, toolName, args, { remote: true });
+        // v0.28: thread per-token takes-holder allow-list so takes_list /
+        // takes_search / query (when it returns takes) can server-side filter.
+        // v0.34.1 (#861): thread source-isolation scope. Legacy access_tokens
+        // path defaults to 'default' per AuthResult.sourceId above.
+        const result = await dispatchToolCall(engine, toolName, args, {
+          remote: true,
+          takesHoldersAllowList: auth.takesHoldersAllowList,
+          sourceId: auth.sourceId,
+        });
         const status = result.isError ? 'error' : 'success';
         logRequest(auth.tokenName!, `tools/call:${toolName}`, status, Date.now() - startedMs);
         return Response.json(

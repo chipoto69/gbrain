@@ -1,11 +1,11 @@
 /**
- * gbrain skillify check — 10-item post-task audit.
+ * gbrain skillify check — 11-item post-task audit.
  *
  * Promoted from `scripts/skillify-check.ts` (D-CX-2). The legacy
  * script stays as a thin shim so existing callers keep working, but
  * the CLI entry point is now `gbrain skillify check`.
  *
- * 10-item checklist (essay Step 3-10):
+ * 11-item checklist (essay Step 3-10 + v0.27.x cross-modal eval):
  *   1. SKILL.md exists
  *   2. Code file exists at target path
  *   3. Unit tests exist
@@ -16,11 +16,28 @@
  *   8. check-resolvable gate (runs `gbrain check-resolvable --json`)
  *   9. E2E smoke (required copy of #4 for required-gate semantics)
  *  10. Brain filing (only when the script writes pages)
+ *  11. Cross-modal eval (INFORMATIONAL; required:false). Looks for a
+ *      receipt at `gbrainPath('eval-receipts')/<slug>-<sha8>.json`
+ *      bound to the current SKILL.md content hash (T10=A,T7=C in
+ *      plans/radiant-napping-lerdorf.md). A missing or stale receipt
+ *      surfaces as a non-blocking note, not a failure.
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'fs';
 import { basename, dirname, join, resolve } from 'path';
 import { spawnSync } from 'child_process';
+
+import { gbrainPath } from '../core/config.ts';
+import {
+  describeReceiptStatus,
+  findReceiptForSkill,
+  type ReceiptStatus,
+} from '../core/cross-modal-eval/receipt-name.ts';
+import { parseSkillFrontmatter } from '../core/skill-frontmatter.ts';
+import {
+  analyzeSkillBrainFirst,
+  buildBrainFirstSummaryLine,
+} from '../core/skill-brain-first.ts';
 
 interface CheckItem {
   name: string;
@@ -259,6 +276,29 @@ function runSkillifyCheckTarget(target: string, root: string): CheckResult {
     ),
   );
 
+  // Item 11: cross-modal eval (informational, T7=C). The receipt is bound
+  // to (slug, sha8 of SKILL.md). The audit doesn't fail on a missing or
+  // stale receipt — it just surfaces the status.
+  const crossModalReceipt = lookupCrossModalReceipt(skillMd, skillName);
+  items.push(
+    checkOptional(
+      'Cross-modal eval (informational)',
+      crossModalReceipt.passed,
+      crossModalReceipt.detail,
+    ),
+  );
+
+  // Item 12: brain-first compliance (v0.36.x, REQUIRED — A3 + F9 from
+  // /plan-eng-review). Skills that reference external lookup tools
+  // (web_search, exa, perplexity, etc.) must declare brain-first stance
+  // explicitly: either via the canonical Convention callout, or via
+  // 'brain_first: exempt' in frontmatter, or by absence of external
+  // refs entirely. This is a REQUIRED gate — non-compliant skills fail
+  // `gbrain skillify check` with exit 1 so new skills can't be born
+  // non-compliant.
+  const brainFirst = checkBrainFirstCompliance(skillMd, skillName);
+  items.push(check('Brain-first compliance', brainFirst.passed, brainFirst.detail));
+
   const passed = items.filter(i => i.passed).length;
   const total = items.length;
   const missing = items.filter(i => !i.passed && i.required).map(i => i.name);
@@ -273,6 +313,90 @@ function runSkillifyCheckTarget(target: string, root: string): CheckResult {
   }
 
   return { path: target, skillName, items, score: passed, total, recommendation };
+}
+
+/**
+ * Item 11 helper: look up the cross-modal eval receipt for this skill.
+ * `passed` is true when a current-sha receipt exists. Stale or missing
+ * receipts return passed=true *for the audit* — item 11 is informational
+ * (T7=C) — but the detail string makes the status visible.
+ *
+ * Reads the receipt from `gbrainPath('eval-receipts')` (T5 correction:
+ * this resolves to <GBRAIN_HOME>/.gbrain/eval-receipts/, NOT the legacy
+ * <GBRAIN_HOME>/eval-receipts/ that the original plan claimed).
+ */
+function lookupCrossModalReceipt(
+  skillMdPath: string,
+  skillName: string,
+): { passed: boolean; detail: string } {
+  if (!existsSync(skillMdPath)) {
+    return { passed: true, detail: 'no SKILL.md — skipping cross-modal eval check' };
+  }
+  let status: ReceiptStatus;
+  try {
+    status = findReceiptForSkill(skillMdPath, gbrainPath('eval-receipts'));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { passed: true, detail: `receipt lookup failed: ${msg}` };
+  }
+  switch (status.status) {
+    case 'found':
+      return { passed: true, detail: describeReceiptStatus(skillName, status) };
+    case 'stale':
+      return {
+        passed: false, // visually marked as not-yet-rerun but item is required:false
+        detail: describeReceiptStatus(skillName, status),
+      };
+    case 'missing':
+      return {
+        passed: false,
+        detail: describeReceiptStatus(skillName, status),
+      };
+  }
+}
+
+/**
+ * Item 12 helper: brain-first compliance gate.
+ *
+ * Reads the skill's SKILL.md, parses frontmatter, runs the pure
+ * `analyzeSkillBrainFirst()` analyzer. A `warn` status fails this
+ * required item; an `ok` status (any exemption or compliance reason)
+ * passes.
+ *
+ * When SKILL.md doesn't exist, the check passes — item 1 already
+ * reported the missing file; we don't pile-on with a second failure.
+ *
+ * Detail string follows the same shape as the doctor check message
+ * (via `buildBrainFirstSummaryLine`) so the two surfaces stay
+ * consistent for skill authors learning the contract.
+ */
+function checkBrainFirstCompliance(
+  skillMdPath: string,
+  skillName: string,
+): { passed: boolean; detail: string } {
+  if (!existsSync(skillMdPath)) {
+    return { passed: true, detail: 'no SKILL.md — covered by item 1' };
+  }
+  let content: string;
+  try {
+    content = readFileSync(skillMdPath, 'utf-8');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Read failure is best-effort — don't double-fail; item 1 / 2 would
+    // already report the problem. Pass with a note.
+    return { passed: true, detail: `could not read SKILL.md: ${msg}` };
+  }
+  const fm = parseSkillFrontmatter(content);
+  const analysis = analyzeSkillBrainFirst(content, skillName, fm);
+  if (analysis.status === 'ok') {
+    return { passed: true, detail: `${analysis.reason} (${skillName})` };
+  }
+  return {
+    passed: false,
+    detail:
+      buildBrainFirstSummaryLine(analysis) +
+      ` — Fix: add canonical Convention callout (see conventions/brain-first.md), or set 'brain_first: exempt' in frontmatter.`,
+  };
 }
 
 function recentlyModified(root: string, days: number = 7): string[] {

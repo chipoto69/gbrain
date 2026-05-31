@@ -19,9 +19,101 @@ import type {
 import { UnrecoverableError } from './types.ts';
 import { MinionQueue } from './queue.ts';
 import { calculateBackoff } from './backoff.ts';
+import { RateLeaseUnavailableError } from './handlers/subagent.ts';
+import { logLeasePressure } from './lease-pressure-audit.ts';
+import {
+  runLockRenewalTick,
+  resolveLockRenewalKnobs,
+  type LockRenewalDeps,
+  type LockRenewalState,
+} from './lock-renewal-tick.ts';
+import { lockRenewalAudit } from '../audit/lock-renewal-audit.ts';
+
+/**
+ * Abort reasons that signal infrastructure failure (PgBouncer outage,
+ * connection drop, lock reclaimed by another worker) — NOT a job
+ * defect. executeJob's catch block consults this set and SKIPS failJob
+ * for these reasons, letting the stall detector requeue the row
+ * cleanly without burning an attempt or dead-lettering the job.
+ *
+ * Codex C6 absorption (D8a): pre-v0.41.22.2, a PgBouncer blip during a
+ * long-running job would lock-renewal-abort → handler throws → failJob
+ * burns an attempt. That's wrong direction: the job's fine; the
+ * infrastructure stumbled. Stall-detector reclaim is the correct path.
+ *
+ * Exported so tests can pin the named-constant contract (a future edit
+ * to this set is a deliberate two-line change, not a silent regression).
+ */
+export const INFRASTRUCTURE_ABORT_REASONS = new Set<string>([
+  'lock-renewal-failed',
+  'lock-lost',
+]);
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'events';
 import { evaluateQuietHours, type QuietHoursConfig } from './quiet-hours.ts';
+import { readFileSync } from 'fs';
+
+/**
+ * Pure parser for /proc/self/status RSS fields. Returns bytes of
+ * RssAnon + RssShmem when either field is present, or null when the
+ * status text is from a kernel that doesn't expose those fields
+ * (kernels older than 4.5) or the values are malformed. Exported so
+ * the test suite can unit-test the field-presence + malformed-value
+ * edge cases without mocking the filesystem.
+ *
+ * M1 fix: field-presence check, not value-presence check. The earlier
+ * `if (anonKb > 0)` form conflated "field exists with value 0" with
+ * "field missing", which mis-routed to VmRSS fallback in the legitimate
+ * shmem-only worker case (RssAnon: 0 + RssShmem: 512).
+ */
+export function parseRssFromProcStatus(status: string): number | null {
+  const anonMatch = status.match(/^RssAnon:\s+(\d+)/m);
+  const shmemMatch = status.match(/^RssShmem:\s+(\d+)/m);
+  if (anonMatch === null && shmemMatch === null) {
+    return null;
+  }
+  const anonKb = parseInt(anonMatch?.[1] ?? '0', 10);
+  const shmemKb = parseInt(shmemMatch?.[1] ?? '0', 10);
+  if (isNaN(anonKb) || isNaN(shmemKb)) {
+    return null;
+  }
+  return (anonKb + shmemKb) * 1024; // bytes
+}
+
+/**
+ * Read accurate RSS from /proc/self/status (RssAnon + RssShmem).
+ *
+ * `process.memoryUsage().rss` returns VmRSS which includes file-backed mmap'd
+ * pages (e.g. git packfiles). On a 96K-page brain repo, git operations can
+ * inflate VmRSS to 7GB+ while actual heap usage is ~100MB. The kernel reclaims
+ * file-backed pages under memory pressure — they're cache, not real usage.
+ *
+ * RssAnon = anonymous pages (heap, stack, anonymous mmap). RssShmem = shared
+ * anonymous pages (IPC, tmpfs). Their sum is the non-file-backed resident
+ * memory used for **per-process leak detection** — exactly the metric a leak
+ * watchdog wants. It is NOT a full container-OOM metric: cgroup memory
+ * pressure includes page cache, so a sibling container holding the page
+ * cache hot can OOM us even at low anon+shmem. Use cgroup-aware monitoring
+ * for that scenario; this helper is for the worker's own leak guard.
+ *
+ * Falls back to process.memoryUsage().rss on non-Linux, missing /proc, or
+ * kernels older than 4.5 that don't expose RssAnon/RssShmem.
+ *
+ * `readStatus` is injectable for tests — production callers use the default,
+ * which reads `/proc/self/status`.
+ */
+export function getAccurateRss(
+  readStatus: () => string = () => readFileSync('/proc/self/status', 'utf8'),
+): number {
+  try {
+    const status = readStatus();
+    const parsed = parseRssFromProcStatus(status);
+    if (parsed !== null) return parsed;
+  } catch {
+    // Non-Linux or /proc unavailable
+  }
+  return process.memoryUsage().rss;
+}
 
 /** Reason payload emitted with `'unhealthy'` when self-health-check trips.
  *  CLI layer (jobs.ts:work) subscribes and decides whether to call process.exit. */
@@ -93,7 +185,7 @@ export class MinionWorker extends EventEmitter {
       maxStalledCount: opts?.maxStalledCount ?? 1,
       pollInterval: opts?.pollInterval ?? 5000,
       maxRssMb: opts?.maxRssMb ?? 0,
-      getRss: opts?.getRss ?? (() => process.memoryUsage().rss),
+      getRss: opts?.getRss ?? getAccurateRss,
       rssCheckInterval: opts?.rssCheckInterval ?? 60000,
       healthCheckInterval: opts?.healthCheckInterval ?? 60000,
       stallWarnAfterMs: opts?.stallWarnAfterMs ?? 5 * 60_000,
@@ -422,6 +514,17 @@ export class MinionWorker extends EventEmitter {
         ]);
       }
 
+      // The worker does NOT disconnect the engine: it doesn't own the
+      // engine's lifecycle. The caller (CLI handler at src/commands/jobs.ts
+      // case 'work', or a test fixture) is responsible for disconnect when
+      // it has finished using the engine. Earlier wave's experiment of
+      // calling engine.disconnect() here violated ownership and broke
+      // every test that shared a single engine across multiple
+      // worker.start() / worker.stop() cycles (PGLiteEngine kills its
+      // single _db connection; PostgresEngine.disconnect was non-idempotent
+      // and clobbered the global db singleton on the second call). The
+      // pool-slot-release intent is now handled in the CLI handler which
+      // does own the engine.
       console.log('Minion worker stopped.');
     }
   }
@@ -534,61 +637,182 @@ export class MinionWorker extends EventEmitter {
     this.running = false;
   }
 
-  /** Launch a job as an independent in-flight promise. */
+  /**
+   * Launch a job as an independent in-flight promise.
+   *
+   * v0.41.22.2 hardening — the lock-renewal cathedral wave (closes the
+   * production unhandledRejection crash class + 4 codex outside-voice
+   * gaps). The renewal timer now wraps a pure `runLockRenewalTick`
+   * call from `src/core/minions/lock-renewal-tick.ts` rather than
+   * inlining `setInterval(async () => { await renewLock(...) })` —
+   * which would let any throw escape to `process.on('unhandledRejection')`
+   * and crash the worker (the v0.41.22.1 bug).
+   *
+   * State machine guarded by:
+   *   - `cancelled` flag set in the finally block so an in-flight
+   *     renewLock that resolves after the job ended bails cleanly (D1)
+   *   - `tickInFlight` re-entrancy guard so overlapping ticks during a
+   *     PgBouncer stall don't pile concurrent connection acquisitions
+   *     on an already-saturated pool
+   *   - `Promise.race(renewLock, timeoutPromise)` inside the tick so a
+   *     hung connection can't wedge the re-entrancy guard forever (D6 / codex C3)
+   *   - time-based abort (`Date.now() - lastSuccessfulRenewalAt >=
+   *     lockDuration - safetyMargin`) so we voluntarily release BEFORE
+   *     the stall detector can reclaim the row (D6 / codex C2)
+   *
+   * Universal grace-eviction (D8b / codex C7): the 30s force-evict
+   * safety net fires for ANY abort reason, not just `job.timeout_ms`.
+   * Handlers that ignore AbortSignal won't wedge the inFlight slot
+   * forever on lock-renewal aborts.
+   *
+   * Second unhandledRejection vector (D7 / codex C5): the stored
+   * `executeJob(...).finally(...)` promise gets an explicit `.catch()`
+   * so an unhandled rejection inside the finally/catch chain (e.g.,
+   * `failJob` throwing during the same DB outage) can't propagate to
+   * the process-level handler and crash the daemon.
+   */
   private launchJob(job: MinionJob, lockToken: string): void {
     const abort = new AbortController();
 
-    // Start lock renewal (per-job timer, not shared)
-    const lockTimer = setInterval(async () => {
-      const renewed = await this.queue.renewLock(job.id, lockToken, this.opts.lockDuration);
-      if (!renewed) {
-        console.warn(`Lock lost for job ${job.id}, aborting execution`);
-        clearInterval(lockTimer);
-        abort.abort(new Error('lock-lost'));
-      }
+    // --- D1: cancellation flag for the in-flight renewal IIFE ---
+    let cancelled = false;
+    // --- re-entrancy guard for overlapping ticks during PgBouncer stalls ---
+    let tickInFlight = false;
+
+    // --- D3: pure-function lock renewal ---
+    const knobs = resolveLockRenewalKnobs(process.env, this.opts.lockDuration);
+    const renewalState: LockRenewalState = {
+      jobId: job.id,
+      jobName: job.name,
+      lockToken,
+      lockDurationMs: this.opts.lockDuration,
+      knobs,
+      lastSuccessfulRenewalAt: Date.now(),
+      consecutiveFailures: 0,
+      cancelled: () => cancelled,
+    };
+    const renewalDeps: LockRenewalDeps = {
+      renewLock: (id, tok, dur) => this.queue.renewLock(id, tok, dur),
+      audit: lockRenewalAudit,
+      now: Date.now,
+      setTimeout: (cb, ms) => globalThis.setTimeout(cb, ms),
+    };
+
+    const lockTimer = setInterval(() => {
+      if (tickInFlight) return;
+      tickInFlight = true;
+      void runLockRenewalTick(renewalDeps, renewalState)
+        .then((result) => {
+          if (cancelled) return;
+          switch (result.kind) {
+            case 'ok':
+            case 'cancelled':
+              return;
+            case 'lock_lost':
+              if (!abort.signal.aborted) {
+                console.warn(`Lock lost for job ${job.id}, aborting execution`);
+                clearInterval(lockTimer);
+                abort.abort(new Error('lock-lost'));
+              }
+              return;
+            case 'should_abort':
+              if (!abort.signal.aborted) {
+                clearInterval(lockTimer);
+                abort.abort(new Error(result.reason));
+              }
+              return;
+          }
+        })
+        .catch((err) => {
+          // Belt-and-suspenders. runLockRenewalTick's own try/catch
+          // should make this unreachable, but a stray throw from the
+          // .then handler itself (console.warn EPIPE on a piped worker
+          // for instance) would otherwise propagate to
+          // unhandledRejection and crash the daemon — the exact bug
+          // class this whole wave exists to close.
+          const msg = err instanceof Error ? err.message : String(err);
+          console.error(`[worker] runLockRenewalTick post-handler error: ${msg}`);
+        })
+        .finally(() => {
+          tickInFlight = false;
+        });
     }, this.opts.lockDuration / 2);
 
-    // Per-job wall-clock timeout safety net. Cooperative: fires abort() so the
-    // handler's signal flips. Handlers ignoring AbortSignal can't be force-killed
-    // from JS; the DB-side handleTimeouts is the authoritative status flip.
-    // The .finally clearTimeout below ensures process exit isn't delayed by a
-    // dangling timer on normal completion.
-    let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+    // --- D8b: universal grace-eviction timer ---
+    // Fires for ANY abort reason (not just job.timeout_ms). Without
+    // this generalization, lock-renewal aborts could leave the inFlight
+    // slot wedged forever if the handler ignores AbortSignal.
     let graceTimer: ReturnType<typeof setTimeout> | null = null;
+    abort.signal.addEventListener('abort', () => {
+      // Avoid scheduling a second grace timer if abort fires again
+      // (e.g., timeout + lock-renewal-failed close to each other).
+      if (graceTimer != null) return;
+      graceTimer = setTimeout(() => {
+        if (this.inFlight.has(job.id)) {
+          const reason = abort.signal.reason instanceof Error
+            ? abort.signal.reason.message
+            : String(abort.signal.reason);
+          console.warn(
+            `Job ${job.id} (${job.name}) did not exit within 30s of abort (reason: ${reason}). ` +
+            `Force-evicting from inFlight to unblock worker. ` +
+            `The handler is still running but the worker will claim new jobs.`
+          );
+          clearInterval(lockTimer);
+          this.inFlight.delete(job.id);
+          // D8a: don't failJob if the abort was infrastructure. The
+          // stall detector will reclaim the row cleanly because the
+          // lock has expired (lock-renewal aborts only fire after
+          // lockDuration - safetyMargin elapsed without renewal).
+          if (!INFRASTRUCTURE_ABORT_REASONS.has(reason)) {
+            this.queue.failJob(
+              job.id,
+              lockToken,
+              'handler ignored abort signal (force-evicted)',
+              'dead',
+            ).catch(() => {});
+          }
+        }
+      }, 30_000);
+    });
+
+    // Per-job wall-clock timeout (timer-armed only if `timeout_ms` was
+    // set on the job; the grace-evict pattern above now lives outside
+    // this branch).
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
     if (job.timeout_ms != null) {
       timeoutTimer = setTimeout(() => {
         if (!abort.signal.aborted) {
           console.warn(`Job ${job.id} (${job.name}) hit per-job timeout (${job.timeout_ms}ms), aborting`);
           abort.abort(new Error('timeout'));
         }
-        // Safety net: if the handler doesn't resolve within 30s after abort,
-        // force-evict from inFlight so the worker can pick up new jobs.
-        // Without this, a handler that ignores AbortSignal wedges the worker
-        // forever (the 98-waiting-0-active incident on 2026-04-24).
-        graceTimer = setTimeout(() => {
-          if (this.inFlight.has(job.id)) {
-            console.warn(
-              `Job ${job.id} (${job.name}) did not exit within 30s of abort. ` +
-              `Force-evicting from inFlight to unblock worker. ` +
-              `The handler is still running but the worker will claim new jobs.`
-            );
-            clearInterval(lockTimer);
-            this.inFlight.delete(job.id);
-            // Best-effort: mark as dead in DB so it doesn't get reclaimed
-            this.queue.failJob(job.id, lockToken, 'handler ignored abort signal (force-evicted)', 'dead').catch(() => {});
-          }
-        }, 30_000);
       }, job.timeout_ms);
     }
 
     const promise = this.executeJob(job, lockToken, abort, lockTimer)
       .finally(() => {
+        // D1: signal in-flight IIFE to bail at its next checkpoint so
+        // a renewLock resolution that lands after the job ended
+        // doesn't write a misleading audit event or abort an
+        // already-dead controller.
+        cancelled = true;
         clearInterval(lockTimer);
         if (timeoutTimer) clearTimeout(timeoutTimer);
         if (graceTimer) clearTimeout(graceTimer);
         this.inFlight.delete(job.id);
         this.jobsCompleted += 1;
         this.checkMemoryLimit('post-job');
+      })
+      // D7 / codex C5: close the SECOND unhandledRejection vector. If
+      // executeJob's catch path throws (e.g., failJob's executeRaw
+      // throws during the same DB outage that caused lock renewal to
+      // fail), the rejection would otherwise escape to
+      // process.on('unhandledRejection') and crash the daemon.
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[worker] executeJob unhandled error for job ${job.id} (${job.name}): ${msg}`);
+        try {
+          lockRenewalAudit.logExecuteJobRejected(job.id, job.name, err);
+        } catch { /* audit best-effort */ }
       });
 
     this.inFlight.set(job.id, { job, lockToken, lockTimer, abort, promise });
@@ -675,13 +899,82 @@ export class MinionWorker extends EventEmitter {
       // left jobs stranded in 'active' until a secondary sweep, breaking
       // timeout/cancel contracts downstream callers rely on.
       let errorText: string;
+      let abortReason: string | null = null;
       if (abort.signal.aborted) {
-        const reason = abort.signal.reason instanceof Error
+        abortReason = abort.signal.reason instanceof Error
           ? abort.signal.reason.message
           : String(abort.signal.reason || 'aborted');
-        errorText = `aborted: ${reason}`;
+        errorText = `aborted: ${abortReason}`;
       } else {
         errorText = err instanceof Error ? err.message : String(err);
+      }
+
+      // v0.41.22.2 (D8a / codex C6): infrastructure aborts (lock-renewal-failed,
+      // lock-lost) are NOT job defects — they're connection / coordination
+      // failures the stall detector will reclaim cleanly. Calling failJob here
+      // would burn an attempt or dead-letter the job for what's really a
+      // PgBouncer blip; that's a worse outcome than the v0.41.22.1 crash it
+      // replaces. The lock has already expired (lock-renewal-failed only fires
+      // after lockDuration - safetyMargin elapsed without renewal), so the
+      // stall detector will pick the row up on its next poll and another
+      // worker will claim it cleanly.
+      if (abortReason !== null && INFRASTRUCTURE_ABORT_REASONS.has(abortReason)) {
+        console.log(
+          `Job ${job.id} (${job.name}) released after infrastructure abort (${abortReason}); ` +
+          `stall detector will requeue (no attempt burned)`,
+        );
+        return;
+      }
+
+      // v0.41 Bug 2: lease-full bounces don't burn attempts.
+      //
+      // Pre-v0.41 every non-`UnrecoverableError` routed to `delayed` with
+      // exponential backoff BUT still incremented `attempts_made`. After 3
+      // lease-full bounces the job hit `max_attempts` and dead-lettered
+      // with message `rate lease "..." full (N/M)` — operators saw a
+      // "dead" job and assumed real failure. The field-report dead-letter
+      // loop is exactly this path.
+      //
+      // Detect `RateLeaseUnavailableError` BEFORE the attempts-exhaustion
+      // gate and route through `queue.releaseLeaseFullJob` which mirrors
+      // `failJob` minus the `attempts_made` increment. Audit row to
+      // `minion_lease_pressure_log` so operators see pressure live in
+      // `gbrain doctor` + `gbrain jobs stats lease_pressure`.
+      const isLeaseFull = err instanceof RateLeaseUnavailableError;
+      if (isLeaseFull) {
+        const leaseErr = err as RateLeaseUnavailableError;
+        // 1-3s jittered backoff. Not the exponential curve — this is "yield
+        // the slot, try again soon", not "give up after a few tries."
+        const leaseBackoffMs = 1000 + Math.floor(Math.random() * 2000);
+        const released = await this.queue.releaseLeaseFullJob(
+          job.id, lockToken, errorText, leaseBackoffMs,
+        );
+        if (!released) {
+          console.warn(`Job ${job.id} lease-full release dropped (lock token mismatch)`);
+          return;
+        }
+        // Audit row write is best-effort — never blocks the bypass path.
+        // Denormalized columns persist past `gbrain jobs prune` so post-NULL
+        // forensic queries still see context (Eng D8 / codex pass-3 #7).
+        await logLeasePressure(this.engine, {
+          job_id: job.id,
+          lease_key: leaseErr.key,
+          active_at_bounce: leaseErr.active,
+          max_concurrent: Number.isFinite(leaseErr.max) ? leaseErr.max : -1,
+          queue_name: job.queue,
+          job_name: job.name,
+          // Best-effort context — populated when we can. The worker doesn't
+          // always know the model at catch time (model is resolved inside
+          // the handler), so leave NULL when unavailable. The doctor check's
+          // aggregate queries handle NULL gracefully.
+          model: null,
+          provider: null,
+          root_owner_id: job.parent_job_id ?? null,
+        });
+        console.log(
+          `Job ${job.id} (${job.name}) lease-full, re-queuing in ${Math.round(leaseBackoffMs)}ms (no attempt burned)`,
+        );
+        return;
       }
 
       const isUnrecoverable = err instanceof UnrecoverableError;
