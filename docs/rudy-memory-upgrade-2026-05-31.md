@@ -157,6 +157,38 @@ proof that the deployed service has all v0.42 features. Upgrading the Edge
 function needs its own deploy plan after DB credentials and migration readiness
 are settled.
 
+Live probe result on 2026-05-31:
+
+- status: `not_ready` for full memory-module activation
+- deployed version: `0.7.0`
+- remote tools: `25`
+- local v0.42 tools: `88`
+- missing required write tool: `put_page`
+
+The deployed Edge MCP is still useful for read/search and limited write
+surfaces such as tags, links, timeline entries, and raw data. It is not safe to
+advertise it as the full page-write memory module until `put_page` is available
+or a v0.42 `gbrain serve --http` deployment is reachable.
+
+For architecture integration, use the richer readiness probe:
+
+```bash
+bun scripts/rudy/remote-mcp-readiness.ts \
+  --from-claude-json /Users/rudlord/.claude.json \
+  --server gbrain
+```
+
+This reports whether the remote is `full`, `limited`, or `not_ready`.
+`limited` means the core memory operations are usable, but the deployed remote
+does not expose the full local v0.42 tool surface. To make that gap fail hard:
+
+```bash
+bun scripts/rudy/remote-mcp-readiness.ts \
+  --from-claude-json /Users/rudlord/.claude.json \
+  --server gbrain \
+  --strict-full-surface
+```
+
 ## One-file canary
 
 Use the canary before any broad import:
@@ -198,8 +230,17 @@ Expected successful checks:
 - `tools/list`
 - `get_stats`
 
+For an integration-ready status report that compares the deployed remote MCP
+against the local v0.42 tool registry:
+
+```bash
+bun scripts/rudy/remote-mcp-readiness.ts \
+  --from-claude-json /Users/rudlord/.claude.json \
+  --server gbrain
+```
+
 This route talks to the deployed Supabase Edge MCP endpoint and does not require
-the broken local `database_url`. It is suitable for MCP-equivalent operations
-such as search, query, get, put, tags, links, and timeline writes. It is not a
-replacement for host-side DB access when applying migrations, taking backups,
-running sync/import, or re-embedding.
+the broken local `database_url`. It is suitable for MCP-equivalent read/search
+operations and limited writes such as tags, links, timeline entries, and raw
+data. It is not a replacement for page writes, host-side DB access, migrations,
+backups, sync/import, or re-embedding.
