@@ -127,9 +127,13 @@ export function compareToolSurface(
   };
 }
 
-async function localToolNames(): Promise<string[]> {
+export async function expectedRemoteToolNames(): Promise<string[]> {
   const mod = await import('../../src/core/operations.ts');
-  return normalizeToolNames(mod.operations.map((op: { name: string }) => op.name));
+  return normalizeToolNames(
+    mod.operations
+      .filter((op: { localOnly?: boolean }) => !op.localOnly)
+      .map((op: { name: string }) => op.name),
+  );
 }
 
 async function rpcCall(
@@ -187,7 +191,7 @@ export async function buildReadinessReport(
     throw new Error(`tools/list returned no parseable tools: ${list.redactedText.slice(0, 500)}`);
   }
 
-  const comparison = compareToolSurface(remoteTools, await localToolNames(), opts.requiredTools);
+  const comparison = compareToolSurface(remoteTools, await expectedRemoteToolNames(), opts.requiredTools);
 
   let statsOk = false;
   let healthOk = false;
@@ -225,7 +229,7 @@ export async function buildReadinessReport(
     stats_ok: statsOk,
     health_ok: healthOk,
     ...(status === 'limited'
-      ? { warning: 'Remote MCP is usable for core memory ops but does not expose the full local v0.42 tool surface.' }
+      ? { warning: 'Remote MCP is usable for core memory ops but does not expose the full local v0.42 remote-callable tool surface.' }
       : {}),
   };
 }
@@ -271,7 +275,7 @@ Options:
   --url URL                MCP URL when using an env token
   --token-env NAME         Env var containing bearer token (default: GBRAIN_MCP_TOKEN)
   --require-tool NAME      Add a required tool to the core readiness gate
-  --strict-full-surface    Exit non-zero unless remote exposes every local tool
+  --strict-full-surface    Exit non-zero unless remote exposes every local HTTP-safe tool
   --timeout-ms N           Per-request timeout (default: 20000)`);
       process.exit(0);
     }

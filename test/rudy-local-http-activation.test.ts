@@ -50,8 +50,21 @@ describe('rudy local HTTP activation', () => {
     });
     expect(plan.status).toBe('plan');
     expect(plan.execute_required).toBe(true);
+    expect(plan.execution_mode).toBe('verify-and-stop');
     expect(plan.mcp_url).toBe('http://127.0.0.1:3131/mcp');
     expect(plan.readiness_gate).toContain('--strict-full-surface');
     expect(plan.warning).toContain('Prefer GBRAIN_DATABASE_URL');
+  });
+
+  test('can plan a keep-alive activation run', () => {
+    const plan = buildPlan({
+      port: 3131,
+      bind: '127.0.0.1',
+      dbUrlSource: 'env:GBRAIN_DATABASE_URL',
+      hasDbUrl: true,
+      keepAlive: true,
+    });
+    expect(plan.execution_mode).toBe('keep-alive');
+    expect(plan.warning).toBeUndefined();
   });
 });

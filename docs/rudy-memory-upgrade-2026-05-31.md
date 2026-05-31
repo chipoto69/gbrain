@@ -162,7 +162,8 @@ Live probe result on 2026-05-31:
 - status: `not_ready` for full memory-module activation
 - deployed version: `0.7.0`
 - remote tools: `25`
-- local v0.42 tools: `88`
+- local v0.42 remote-callable HTTP tools: `81`
+- local v0.42 host-only tools intentionally excluded from HTTP MCP: `7`
 - missing required write tool: `put_page`
 
 The deployed Edge MCP is still useful for read/search and limited write
@@ -180,7 +181,8 @@ bun scripts/rudy/remote-mcp-readiness.ts \
 
 This reports whether the remote is `full`, `limited`, or `not_ready`.
 `limited` means the core memory operations are usable, but the deployed remote
-does not expose the full local v0.42 tool surface. To make that gap fail hard:
+does not expose the full local v0.42 remote-callable HTTP tool surface. To make
+that gap fail hard:
 
 ```bash
 bun scripts/rudy/remote-mcp-readiness.ts \
@@ -194,7 +196,7 @@ bun scripts/rudy/remote-mcp-readiness.ts \
 The fastest full-surface path is to run this checkout as the HTTP MCP server
 against the live Supabase database, then point architecture clients at that
 local/tunneled endpoint. This avoids deploying a risky new Supabase Edge bundle
-while still exposing the local v0.42 tool registry.
+while still exposing the local v0.42 remote-callable HTTP tool registry.
 
 Plan the activation without starting anything:
 
@@ -209,6 +211,14 @@ GBRAIN_DATABASE_URL='postgresql://...' \
   bun scripts/rudy/local-http-activation.ts --execute
 ```
 
+Keep the verified v0.42 HTTP MCP process running for local architecture
+clients after the strict readiness gate passes:
+
+```bash
+GBRAIN_DATABASE_URL='postgresql://...' \
+  bun scripts/rudy/local-http-activation.ts --execute --keep-alive
+```
+
 The script starts:
 
 ```bash
@@ -218,6 +228,10 @@ bun run src/cli.ts serve --http --port 3131 --bind 127.0.0.1 --suppress-bootstra
 Then it reuses the existing bearer token from `/Users/rudlord/.claude.json`
 and runs the strict full-surface readiness gate against
 `http://127.0.0.1:3131/mcp`.
+
+Without `--keep-alive`, the script is a proof gate and stops the child server
+after reporting readiness. With `--keep-alive`, it forwards SIGINT/SIGTERM to
+the child server and keeps serving until interrupted.
 
 Current execute result on 2026-06-01: the harness starts the right v0.42 path
 but `gbrain serve` exits before `/health` because the saved
@@ -272,7 +286,7 @@ Expected successful checks:
 - `get_stats`
 
 For an integration-ready status report that compares the deployed remote MCP
-against the local v0.42 tool registry:
+against the local v0.42 remote-callable HTTP tool registry:
 
 ```bash
 bun scripts/rudy/remote-mcp-readiness.ts \

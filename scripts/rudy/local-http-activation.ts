@@ -11,6 +11,7 @@ export type DbUrlSource = 'env:GBRAIN_DATABASE_URL' | 'env:DATABASE_URL' | 'conf
 export interface LocalActivationPlan {
   status: 'plan';
   execute_required: true;
+  execution_mode: 'verify-and-stop' | 'keep-alive';
   db_url_source: DbUrlSource;
   has_db_url: boolean;
   mcp_url: string;
@@ -62,11 +63,13 @@ export function buildPlan(opts: {
   publicUrl?: string;
   dbUrlSource: DbUrlSource;
   hasDbUrl: boolean;
+  keepAlive?: boolean;
 }): LocalActivationPlan {
   const mcpUrl = localMcpUrl(opts.port, opts.bind);
   return {
     status: 'plan',
     execute_required: true,
+    execution_mode: opts.keepAlive ? 'keep-alive' : 'verify-and-stop',
     db_url_source: opts.dbUrlSource,
     has_db_url: opts.hasDbUrl,
     mcp_url: mcpUrl,
@@ -119,6 +122,7 @@ function parseCli(argv: string[]): {
   claudeJson: string;
   server: string;
   timeoutMs: number;
+  keepAlive: boolean;
 } {
   let execute = false;
   let port = 3131;
@@ -127,10 +131,12 @@ function parseCli(argv: string[]): {
   let claudeJson = '/Users/rudlord/.claude.json';
   let server = 'gbrain';
   let timeoutMs = 30_000;
+  let keepAlive = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--execute') execute = true;
+    else if (arg === '--keep-alive') keepAlive = true;
     else if (arg === '--port') port = Number(argv[++i]);
     else if (arg === '--bind') bind = argv[++i];
     else if (arg === '--public-url') publicUrl = argv[++i];
@@ -147,6 +153,7 @@ Plans or runs the fast local v0.42 activation path:
 
 Options:
   --execute                Actually start the local HTTP server and probe it
+  --keep-alive             After a successful full-surface probe, keep serving until interrupted
   --port N                 Local HTTP port (default: 3131)
   --bind HOST              Bind host (default: 127.0.0.1)
   --public-url URL         Optional public issuer URL for tunneled clients
@@ -162,7 +169,7 @@ The script redacts secrets and does not write ~/.gbrain/config.json.`);
 
   if (!Number.isFinite(port) || port <= 0) throw new Error('--port must be a positive number');
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('--timeout-ms must be a positive number');
-  return { execute, port, bind, publicUrl, claudeJson, server, timeoutMs };
+  return { execute, port, bind, publicUrl, claudeJson, server, timeoutMs, keepAlive };
 }
 
 async function configFileDbUrl(): Promise<string | undefined> {
@@ -172,6 +179,31 @@ async function configFileDbUrl(): Promise<string | undefined> {
 
 function makeLocalConfig(base: RemoteMcpConfig, url: string): RemoteMcpConfig {
   return { url, token: base.token, source: `${base.source} -> local-http` };
+}
+
+async function waitForChildExit(child: ChildProcess): Promise<number> {
+  return await new Promise(resolve => {
+    child.once('exit', (code, signal) => {
+      if (typeof code === 'number') resolve(code);
+      else resolve(signal ? 0 : 1);
+    });
+  });
+}
+
+function installSignalForwarding(child: ChildProcess): () => void {
+  const signals: NodeJS.Signals[] = ['SIGINT', 'SIGTERM'];
+  const handlers = signals.map(signal => {
+    const handler = () => {
+      if (child.exitCode === null) child.kill(signal);
+    };
+    process.once(signal, handler);
+    return { signal, handler };
+  });
+  return () => {
+    for (const { signal, handler } of handlers) {
+      process.off(signal, handler);
+    }
+  };
 }
 
 if (import.meta.main) {
@@ -192,6 +224,7 @@ if (import.meta.main) {
       publicUrl: cli.publicUrl,
       dbUrlSource: source,
       hasDbUrl: source !== 'missing',
+      keepAlive: cli.keepAlive,
     });
 
     if (!cli.execute) {
@@ -235,8 +268,20 @@ if (import.meta.main) {
       ...report,
       db_url_source: source,
       local_http: true,
+      execution_mode: cli.keepAlive ? 'keep-alive' : 'verify-and-stop',
     }, null, 2));
     if (!report.full_surface_ready) process.exitCode = 2;
+    if (cli.keepAlive && report.full_surface_ready) {
+      console.error(`GBrain local HTTP MCP is ready at ${url}; press Ctrl-C to stop.`);
+      const cleanup = installSignalForwarding(child);
+      try {
+        const code = await waitForChildExit(child);
+        child = null;
+        if (code !== 0) process.exitCode = code;
+      } finally {
+        cleanup();
+      }
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     const redacted = redactionSecrets.reduce((acc, secret) => redactSecret(acc, secret), msg);

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   compareToolSurface,
+  expectedRemoteToolNames,
   extractServerInfo,
   extractToolNames,
   hasSuccessfulToolCall,
@@ -38,7 +39,7 @@ describe('rudy remote MCP readiness', () => {
     expect(extractServerInfo(payloads)).toEqual({ name: 'gbrain', version: '0.42.1.0' });
   });
 
-  test('compares core readiness separately from full local surface', () => {
+  test('compares core readiness separately from full remote-callable surface', () => {
     const remote = ['get_page', 'put_page', 'search', 'query', 'add_timeline_entry', 'get_stats', 'get_health'];
     const local = [...remote, 'run_skillopt', 'code_def'];
     const got = compareToolSurface(remote, local, ['get_page', 'search', 'query', 'get_stats']);
@@ -52,6 +53,14 @@ describe('rudy remote MCP readiness', () => {
     const got = compareToolSurface(['get_page'], ['get_page', 'search'], ['get_page', 'search']);
     expect(got.core_ready).toBe(false);
     expect(got.missing_required_tools).toEqual(['search']);
+  });
+
+  test('expected remote surface excludes host-only operations', async () => {
+    const names = await expectedRemoteToolNames();
+    expect(names).toContain('put_page');
+    expect(names).not.toContain('sync_brain');
+    expect(names).not.toContain('file_list');
+    expect(names).not.toContain('get_recent_transcripts');
   });
 
   test('detects successful tool calls without parsing private content', () => {
