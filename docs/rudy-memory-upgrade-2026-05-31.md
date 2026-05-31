@@ -140,17 +140,30 @@ bun scripts/rudy/live-v042-activation.ts
 The plan intentionally ignores `DATABASE_URL` and `~/.gbrain/config.json`.
 Execution requires `GBRAIN_DATABASE_URL` and then runs:
 
-1. external `pg_dump` to a timestamped local file
-2. timestamped in-database backup SQL
-3. readiness SQL plus hard assertions for `embedding_dimensions=384`,
+1. read-only database credential and 384-dimensional invariant preflight
+2. external `pg_dump` to a timestamped local file
+3. timestamped in-database backup SQL
+4. readiness SQL plus hard assertions for `embedding_dimensions=384`,
    `embedding_model=openai:all-MiniLM-L6-v2`, `vector(384)`, nonempty critical
    memory tables, and public-vs-backup row-count parity
-4. local v0.42 HTTP MCP activation with `--keep-alive`
+5. local v0.42 HTTP MCP activation with `--keep-alive`
 
 ```bash
 GBRAIN_DATABASE_URL='postgresql://...' \
   bun scripts/rudy/live-v042-activation.ts --execute
 ```
+
+To prove a candidate database URL before creating a dump, writing rendered SQL,
+creating a backup schema, or starting a server:
+
+```bash
+GBRAIN_DATABASE_URL='postgresql://...' \
+  bun scripts/rudy/live-v042-activation.ts --execute --preflight-only
+```
+
+This runs only `scripts/rudy/supabase-db-preflight.sql`: it authenticates with
+the supplied URL, checks the `384` embedding contract and nonempty critical
+memory tables, then exits.
 
 This wrapper writes rendered SQL files and a custom-format dump under
 `/Users/rudlord/Desktop/gbrain-live-v042-activation/` by default. It does not

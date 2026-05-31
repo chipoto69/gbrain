@@ -21,14 +21,17 @@ export interface PgEnv {
 export interface LiveActivationPlan {
   status: 'plan';
   execute_required: true;
+  execution_mode: 'preflight-only' | 'backup-readiness-and-serve';
   requires_env: 'GBRAIN_DATABASE_URL';
   has_required_db_url: boolean;
   backup_schema: string;
   backup_dir: string;
+  preflight_sql_file: string;
   dump_file: string;
   backup_sql_file: string;
   readiness_sql_file: string;
   commands: {
+    psql_preflight: string[];
     pg_dump: string[];
     psql_backup: string[];
     psql_readiness: string[];
@@ -197,6 +200,10 @@ export function buildPsqlArgs(sqlFile: string): string[] {
   return ['-X', '--no-psqlrc', '--set', 'ON_ERROR_STOP=1', '--file', sqlFile];
 }
 
+export function dbPreflightSqlFile(): string {
+  return join(repoRoot(), 'scripts/rudy/supabase-db-preflight.sql');
+}
+
 export function buildLocalActivationArgs(opts: {
   port: number;
   bind: string;
@@ -234,22 +241,27 @@ export function buildPlan(opts: {
   claudeJson: string;
   server: string;
   timeoutMs: number;
+  preflightOnly?: boolean;
 }): LiveActivationPlan {
   const schema = validateBackupSchemaName(opts.backupSchema);
+  const preflightSqlFile = dbPreflightSqlFile();
   const dumpFile = join(opts.backupDir, `${schema}.dump`);
   const backupSqlFile = join(opts.backupDir, `${schema}.backup.sql`);
   const readinessSqlFile = join(opts.backupDir, `${schema}.readiness.sql`);
   return {
     status: 'plan',
     execute_required: true,
+    execution_mode: opts.preflightOnly ? 'preflight-only' : 'backup-readiness-and-serve',
     requires_env: 'GBRAIN_DATABASE_URL',
     has_required_db_url: Boolean(opts.dbUrl),
     backup_schema: schema,
     backup_dir: opts.backupDir,
+    preflight_sql_file: preflightSqlFile,
     dump_file: dumpFile,
     backup_sql_file: backupSqlFile,
     readiness_sql_file: readinessSqlFile,
     commands: {
+      psql_preflight: ['psql', ...buildPsqlArgs(preflightSqlFile)],
       pg_dump: ['pg_dump', ...buildPgDumpArgs(dumpFile)],
       psql_backup: ['psql', ...buildPsqlArgs(backupSqlFile)],
       psql_readiness: ['psql', ...buildPsqlArgs(readinessSqlFile)],
@@ -298,8 +310,10 @@ function parseCli(argv: string[]): {
   claudeJson: string;
   server: string;
   timeoutMs: number;
+  preflightOnly: boolean;
 } {
   let execute = false;
+  let preflightOnly = false;
   let backupDir = '/Users/rudlord/Desktop/gbrain-live-v042-activation';
   let backupSchema = backupSchemaFromDate();
   let port = 3131;
@@ -318,6 +332,7 @@ function parseCli(argv: string[]): {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--execute') execute = true;
+    else if (arg === '--preflight-only') preflightOnly = true;
     else if (arg === '--backup-dir') backupDir = resolve(readValue(arg, i++));
     else if (arg === '--backup-schema') backupSchema = readValue(arg, i++);
     else if (arg === '--port') port = Number(readValue(arg, i++));
@@ -331,13 +346,15 @@ function parseCli(argv: string[]): {
 
 Plans or runs Rudy's guarded live v0.42 activation sequence:
   1. require GBRAIN_DATABASE_URL
-  2. write an external pg_dump
-  3. create a timestamped in-database backup schema
-  4. assert 384-dim readiness and backup row-count parity
-  5. start local v0.42 HTTP MCP with --keep-alive
+  2. run a read-only DB preflight
+  3. write an external pg_dump
+  4. create a timestamped in-database backup schema
+  5. assert 384-dim readiness and backup row-count parity
+  6. start local v0.42 HTTP MCP with --keep-alive
 
 Options:
   --execute                Run the backup/readiness/activation sequence
+  --preflight-only         With --execute, only verify DB auth and read-only invariants
   --backup-dir PATH        Backup output dir (default: ~/Desktop/gbrain-live-v042-activation)
   --backup-schema NAME     Override timestamped schema name
   --port N                 Local HTTP port (default: 3131)
@@ -366,6 +383,7 @@ This script intentionally ignores DATABASE_URL and ~/.gbrain/config.json.`);
     claudeJson,
     server,
     timeoutMs,
+    preflightOnly,
   };
 }
 
@@ -386,6 +404,7 @@ if (import.meta.main) {
       claudeJson: cli.claudeJson,
       server: cli.server,
       timeoutMs: cli.timeoutMs,
+      preflightOnly: cli.preflightOnly,
     });
 
     if (!cli.execute) {
@@ -398,28 +417,33 @@ if (import.meta.main) {
     }
 
     const pgEnv = pgEnvFromDatabaseUrl(dbUrl);
-    mkdirSync(cli.backupDir, { recursive: true });
-
-    const root = repoRoot();
-    const backupTemplate = readFileSync(join(root, 'scripts/rudy/supabase-preupgrade-backup.sql'), 'utf8');
-    const readinessTemplate = readFileSync(join(root, 'scripts/rudy/supabase-readiness.sql'), 'utf8');
-    writeFileSync(plan.backup_sql_file, renderSqlTemplate(backupTemplate, cli.backupSchema));
-    writeFileSync(
-      plan.readiness_sql_file,
-      [
-        renderSqlTemplate(readinessTemplate, cli.backupSchema),
-        buildReadinessAssertionSql(cli.backupSchema),
-      ].join('\n'),
-    );
-
     const env = {
       ...process.env,
       ...pgEnv,
     };
-    await runCommand('pg_dump', buildPgDumpArgs(plan.dump_file), env, secrets);
-    await runCommand('psql', buildPsqlArgs(plan.backup_sql_file), env, secrets);
-    await runCommand('psql', buildPsqlArgs(plan.readiness_sql_file), env, secrets);
-    await runCommand('bun', buildLocalActivationArgs(cli), process.env, secrets);
+    await runCommand('psql', buildPsqlArgs(plan.preflight_sql_file), env, secrets);
+    if (cli.preflightOnly) {
+      process.exitCode = 0;
+    } else {
+      mkdirSync(cli.backupDir, { recursive: true });
+
+      const root = repoRoot();
+      const backupTemplate = readFileSync(join(root, 'scripts/rudy/supabase-preupgrade-backup.sql'), 'utf8');
+      const readinessTemplate = readFileSync(join(root, 'scripts/rudy/supabase-readiness.sql'), 'utf8');
+      writeFileSync(plan.backup_sql_file, renderSqlTemplate(backupTemplate, cli.backupSchema));
+      writeFileSync(
+        plan.readiness_sql_file,
+        [
+          renderSqlTemplate(readinessTemplate, cli.backupSchema),
+          buildReadinessAssertionSql(cli.backupSchema),
+        ].join('\n'),
+      );
+
+      await runCommand('pg_dump', buildPgDumpArgs(plan.dump_file), env, secrets);
+      await runCommand('psql', buildPsqlArgs(plan.backup_sql_file), env, secrets);
+      await runCommand('psql', buildPsqlArgs(plan.readiness_sql_file), env, secrets);
+      await runCommand('bun', buildLocalActivationArgs(cli), process.env, secrets);
+    }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(secrets.reduce((acc, secret) => redactSecret(acc, secret), message));
