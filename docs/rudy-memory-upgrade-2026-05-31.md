@@ -130,6 +130,34 @@ scripts/rudy/supabase-readiness.sql
 Use them to create a fresh timestamped backup schema and compare live public
 counts against that backup.
 
+The guarded one-shot activation wrapper sequences the safe path after a valid
+Supabase Postgres URL exists:
+
+```bash
+bun scripts/rudy/live-v042-activation.ts
+```
+
+The plan intentionally ignores `DATABASE_URL` and `~/.gbrain/config.json`.
+Execution requires `GBRAIN_DATABASE_URL` and then runs:
+
+1. external `pg_dump` to a timestamped local file
+2. timestamped in-database backup SQL
+3. readiness SQL plus hard assertions for `embedding_dimensions=384`,
+   `embedding_model=openai:all-MiniLM-L6-v2`, `vector(384)`, nonempty critical
+   memory tables, and public-vs-backup row-count parity
+4. local v0.42 HTTP MCP activation with `--keep-alive`
+
+```bash
+GBRAIN_DATABASE_URL='postgresql://...' \
+  bun scripts/rudy/live-v042-activation.ts --execute
+```
+
+This wrapper writes rendered SQL files and a custom-format dump under
+`/Users/rudlord/Desktop/gbrain-live-v042-activation/` by default. It does not
+put the database URL on `pg_dump` or `psql` argv; it derives `PGHOST`,
+`PGDATABASE`, `PGUSER`, `PGPASSWORD`, and `PGSSLMODE` in the child environment
+instead.
+
 Current live readiness markers:
 
 - `public.config.schema_version` is still `1`.
