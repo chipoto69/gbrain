@@ -170,7 +170,7 @@ async function rpcCall(
   }
 }
 
-async function buildReadinessReport(
+export async function buildReadinessReport(
   config: RemoteMcpConfig,
   opts: { requiredTools: string[]; timeoutMs: number },
 ): Promise<ReadinessReport> {

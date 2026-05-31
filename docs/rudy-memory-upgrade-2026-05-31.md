@@ -189,6 +189,47 @@ bun scripts/rudy/remote-mcp-readiness.ts \
   --strict-full-surface
 ```
 
+## Fast local v0.42 activation path
+
+The fastest full-surface path is to run this checkout as the HTTP MCP server
+against the live Supabase database, then point architecture clients at that
+local/tunneled endpoint. This avoids deploying a risky new Supabase Edge bundle
+while still exposing the local v0.42 tool registry.
+
+Plan the activation without starting anything:
+
+```bash
+bun scripts/rudy/local-http-activation.ts
+```
+
+Run it after supplying a valid Supabase Postgres URL as an env override:
+
+```bash
+GBRAIN_DATABASE_URL='postgresql://...' \
+  bun scripts/rudy/local-http-activation.ts --execute
+```
+
+The script starts:
+
+```bash
+bun run src/cli.ts serve --http --port 3131 --bind 127.0.0.1 --suppress-bootstrap-token
+```
+
+Then it reuses the existing bearer token from `/Users/rudlord/.claude.json`
+and runs the strict full-surface readiness gate against
+`http://127.0.0.1:3131/mcp`.
+
+Current execute result on 2026-06-01: the harness starts the right v0.42 path
+but `gbrain serve` exits before `/health` because the saved
+`~/.gbrain/config.json` database URL cannot authenticate:
+
+```text
+password authentication failed for user "postgres"
+```
+
+Do not rewrite `~/.gbrain/config.json` unless the operator wants the new URL
+persisted. Prefer `GBRAIN_DATABASE_URL=...` for one-run activation and proof.
+
 ## One-file canary
 
 Use the canary before any broad import:
