@@ -99,6 +99,7 @@ describe('rudy live v0.42 activation', () => {
     expect(sql).toContain('openai:all-MiniLM-L6-v2');
     expect(sql).toContain('vector(384)');
     expect(sql).toContain('gbrain_backup_20260531_214413.backup_manifest');
+    expect(sql).not.toContain("SELECT 'mcp_request_log', count(*) FROM public.mcp_request_log");
   });
 
   test('local activation args delegate to keep-alive activation gate', () => {

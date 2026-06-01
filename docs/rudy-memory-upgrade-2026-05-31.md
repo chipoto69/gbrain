@@ -145,7 +145,9 @@ Execution requires `GBRAIN_DATABASE_URL` and then runs:
 3. timestamped in-database backup SQL
 4. readiness SQL plus hard assertions for `embedding_dimensions=384`,
    `embedding_model=openai:all-MiniLM-L6-v2`, `vector(384)`, nonempty critical
-   memory tables, and public-vs-backup row-count parity
+   memory tables, and stable public-vs-backup row-count parity. Volatile
+   request telemetry such as `mcp_request_log` is reported but not exact-parity
+   gated because MCP probes can append rows while the backup is running.
 5. local v0.42 HTTP MCP activation with `--keep-alive`
 
 ```bash

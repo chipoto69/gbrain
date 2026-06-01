@@ -142,7 +142,6 @@ BEGIN
     SELECT 'ingest_log', count(*) FROM public.ingest_log UNION ALL
     SELECT 'page_versions', count(*) FROM public.page_versions UNION ALL
     SELECT 'access_tokens', count(*) FROM public.access_tokens UNION ALL
-    SELECT 'mcp_request_log', count(*) FROM public.mcp_request_log UNION ALL
     SELECT 'oauth_clients', count(*) FROM public.oauth_clients
   ),
   comparison AS (
