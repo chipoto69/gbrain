@@ -203,6 +203,10 @@ export function dbPreflightSqlFile(): string {
   return join(repoRoot(), 'scripts/rudy/supabase-db-preflight.sql');
 }
 
+export function localActivationScriptFile(): string {
+  return join(repoRoot(), 'scripts/rudy/local-http-activation.ts');
+}
+
 export function buildLocalActivationArgs(opts: {
   port: number;
   bind: string;
@@ -212,7 +216,7 @@ export function buildLocalActivationArgs(opts: {
   timeoutMs: number;
 }): string[] {
   const args = [
-    'scripts/rudy/local-http-activation.ts',
+    localActivationScriptFile(),
     '--execute',
     '--keep-alive',
     '--port',

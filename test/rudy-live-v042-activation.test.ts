@@ -5,6 +5,7 @@ import {
   buildPlan,
   buildReadinessAssertionSql,
   dbPreflightSqlFile,
+  localActivationScriptFile,
   pgEnvFromDatabaseUrl,
   renderSqlTemplate,
   validateBackupSchemaName,
@@ -103,6 +104,9 @@ describe('rudy live v0.42 activation', () => {
   });
 
   test('local activation args delegate to keep-alive activation gate', () => {
+    const scriptFile = localActivationScriptFile();
+    expect(scriptFile.endsWith('/scripts/rudy/local-http-activation.ts')).toBe(true);
+    expect(scriptFile.startsWith('/')).toBe(true);
     expect(buildLocalActivationArgs({
       port: 3131,
       bind: '127.0.0.1',
@@ -110,7 +114,7 @@ describe('rudy live v0.42 activation', () => {
       server: 'gbrain',
       timeoutMs: 30_000,
     })).toEqual([
-      'scripts/rudy/local-http-activation.ts',
+      scriptFile,
       '--execute',
       '--keep-alive',
       '--port',
