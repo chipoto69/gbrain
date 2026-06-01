@@ -189,6 +189,20 @@ function makeLocalConfig(base: RemoteMcpConfig, url: string): RemoteMcpConfig {
   return { url, token: base.token, source: `${base.source} -> local-http` };
 }
 
+export function buildServeEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  generatedBootstrapToken = randomBytes(36).toString('base64url'),
+): { env: NodeJS.ProcessEnv; bootstrapToken: string } {
+  const bootstrapToken = baseEnv.GBRAIN_ADMIN_BOOTSTRAP_TOKEN || generatedBootstrapToken;
+  return {
+    env: {
+      ...baseEnv,
+      GBRAIN_ADMIN_BOOTSTRAP_TOKEN: bootstrapToken,
+    },
+    bootstrapToken,
+  };
+}
+
 async function waitForChildExit(child: ChildProcess): Promise<number> {
   return await new Promise(resolve => {
     child.once('exit', (code, signal) => {
@@ -250,12 +264,8 @@ if (import.meta.main) {
     }
 
     const bearerConfig = readClaudeMcpConfig(resolve(cli.claudeJson), cli.server);
-    const bootstrapToken = process.env.GBRAIN_ADMIN_BOOTSTRAP_TOKEN || randomBytes(36).toString('base64url');
+    const { env, bootstrapToken } = buildServeEnv(process.env);
     redactionSecrets.push(bootstrapToken);
-    const env = {
-      ...process.env,
-      GBRAIN_ADMIN_BOOTSTRAP_TOKEN: bootstrapToken,
-    };
     const args = buildServeArgs({
       port: cli.port,
       bind: cli.bind,

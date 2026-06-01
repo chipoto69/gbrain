@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
   buildPlan,
+  buildServeEnv,
   buildServeArgs,
   childExitCode,
   dbUrlSource,
@@ -76,5 +77,18 @@ describe('rudy local HTTP activation', () => {
     expect(childExitCode(null, 'SIGTERM')).toBe(0);
     expect(childExitCode(null, 'SIGSEGV')).toBe(1);
     expect(childExitCode(null, null)).toBe(1);
+  });
+
+  test('passes database URL env through to the local serve child', () => {
+    const { env, bootstrapToken } = buildServeEnv({
+      GBRAIN_DATABASE_URL: 'postgresql://postgres:secret@example.com/postgres',
+      DATABASE_URL: 'postgresql://fallback:secret@example.com/postgres',
+      GBRAIN_ADMIN_BOOTSTRAP_TOKEN: undefined,
+    }, 'generated-token');
+
+    expect(env.GBRAIN_DATABASE_URL).toBe('postgresql://postgres:secret@example.com/postgres');
+    expect(env.DATABASE_URL).toBe('postgresql://fallback:secret@example.com/postgres');
+    expect(env.GBRAIN_ADMIN_BOOTSTRAP_TOKEN).toBe('generated-token');
+    expect(bootstrapToken).toBe('generated-token');
   });
 });
