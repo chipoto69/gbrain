@@ -150,6 +150,8 @@ describe('rudy remote MCP readiness', () => {
       expect(report.core_ready).toBe(true);
       expect(report.stats_ok).toBe(true);
       expect(report.health_ok).toBe(true);
+      expect(report.write_probe_required).toBe(true);
+      expect(report.write_probe_ok).toBe(true);
       expect(calls.map((call: any) => call.method)).toEqual([
         'initialize',
         'notifications/initialized',
@@ -157,8 +159,13 @@ describe('rudy remote MCP readiness', () => {
         'tools/list',
         'tools/call',
         'tools/call',
+        'tools/call',
       ]);
       expect((calls[3] as any).params).toEqual({ cursor: 'page-2' });
+      expect((calls[6] as any).params).toMatchObject({
+        name: 'put_page',
+        arguments: { dry_run: true },
+      });
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -214,6 +221,67 @@ describe('rudy remote MCP readiness', () => {
       expect(report.full_surface_ready).toBe(true);
       expect(report.stats_ok).toBe(true);
       expect(report.health_ok).toBe(false);
+      expect(report.status).toBe('not_ready');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('does not report ready when the dry-run write-scope probe is rejected', async () => {
+    const originalFetch = globalThis.fetch;
+    const tools = (await expectedRemoteToolNames()).map(name => ({ name }));
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}'));
+      if (body.method === 'initialize') {
+        return Response.json({
+          jsonrpc: '2.0',
+          id: body.id,
+          result: {
+            serverInfo: { name: 'gbrain', version: '0.42.1.0' },
+            capabilities: { tools: {} },
+          },
+        });
+      }
+      if (body.method === 'notifications/initialized') {
+        return new Response(null, { status: 204 });
+      }
+      if (body.method === 'tools/list') {
+        return Response.json({
+          jsonrpc: '2.0',
+          id: body.id,
+          result: { tools },
+        });
+      }
+      if (body.method === 'tools/call' && (body.params?.name === 'get_stats' || body.params?.name === 'get_health')) {
+        return Response.json({
+          jsonrpc: '2.0',
+          id: body.id,
+          result: { content: [{ type: 'text', text: '{}' }] },
+        });
+      }
+      if (body.method === 'tools/call' && body.params?.name === 'put_page') {
+        return Response.json({
+          jsonrpc: '2.0',
+          id: body.id,
+          result: {
+            isError: true,
+            content: [{ type: 'text', text: '{"error":"insufficient_scope"}' }],
+          },
+        });
+      }
+      return Response.json({ error: { message: 'unexpected' } }, { status: 500 });
+    }) as typeof fetch;
+
+    try {
+      const report = await buildReadinessReport(
+        { url: 'https://example.invalid/mcp', token: 'secret', source: 'test' },
+        { requiredTools: [...DEFAULT_REQUIRED_TOOLS], timeoutMs: 1_000 },
+      );
+      expect(report.full_surface_ready).toBe(true);
+      expect(report.stats_ok).toBe(true);
+      expect(report.health_ok).toBe(true);
+      expect(report.write_probe_required).toBe(true);
+      expect(report.write_probe_ok).toBe(false);
       expect(report.status).toBe('not_ready');
     } finally {
       globalThis.fetch = originalFetch;

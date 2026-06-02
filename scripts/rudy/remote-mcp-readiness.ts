@@ -37,6 +37,8 @@ export interface ReadinessReport extends ToolSurfaceComparison {
   server_version?: string;
   stats_ok: boolean;
   health_ok: boolean;
+  write_probe_required: boolean;
+  write_probe_ok: boolean;
   warning?: string;
 }
 
@@ -113,6 +115,10 @@ export function hasSuccessfulToolCall(payloads: unknown[]): boolean {
     if (p?.result?.isError === true) return false;
     return Boolean(p?.result);
   });
+}
+
+function requiresWriteProbe(requiredTools: readonly string[], remoteTools: readonly string[]): boolean {
+  return requiredTools.includes('put_page') && remoteTools.includes('put_page');
 }
 
 export function compareToolSurface(
@@ -256,6 +262,7 @@ export async function buildReadinessReport(
 
   let statsOk = false;
   let healthOk = false;
+  let writeProbeOk = true;
   try {
     const stats = await rpcCall(config, id++, 'tools/call', {
       name: 'get_stats',
@@ -274,8 +281,30 @@ export async function buildReadinessReport(
   } catch {
     healthOk = false;
   }
+  const writeProbeRequired = requiresWriteProbe(opts.requiredTools, remoteTools);
+  if (writeProbeRequired) {
+    try {
+      const probe = await rpcCall(config, id++, 'tools/call', {
+        name: 'put_page',
+        arguments: {
+          slug: 'system/readiness-write-scope-canary',
+          content: [
+            '---',
+            'title: Readiness Write Scope Canary',
+            '---',
+            '',
+            'Dry-run probe only. This call must not write durable memory.',
+          ].join('\n'),
+          dry_run: true,
+        },
+      }, opts.timeoutMs);
+      writeProbeOk = hasSuccessfulToolCall(probe.payloads);
+    } catch {
+      writeProbeOk = false;
+    }
+  }
 
-  const probesOk = statsOk && healthOk;
+  const probesOk = statsOk && healthOk && writeProbeOk;
   const status = comparison.full_surface_ready && probesOk
     ? 'full'
     : comparison.core_ready && probesOk
@@ -290,6 +319,8 @@ export async function buildReadinessReport(
     ...comparison,
     stats_ok: statsOk,
     health_ok: healthOk,
+    write_probe_required: writeProbeRequired,
+    write_probe_ok: writeProbeOk,
     ...(status === 'limited'
       ? { warning: 'Remote MCP is usable for core memory ops but does not expose the full local v0.42 remote-callable tool surface.' }
       : {}),
