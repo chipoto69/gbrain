@@ -43,6 +43,10 @@ describe('rudy live v0.42 activation', () => {
     });
   });
 
+  test('rejects non-Postgres database URL protocols', () => {
+    expect(() => pgEnvFromDatabaseUrl('https://example.com/postgres')).toThrow('postgres:// or postgresql://');
+  });
+
   test('plans without leaking database URL credentials', () => {
     const plan = buildPlan({
       dbUrl: 'postgresql://postgres:secret@example.com:6543/postgres?sslmode=require',
@@ -100,6 +104,10 @@ describe('rudy live v0.42 activation', () => {
     expect(sql).toContain('openai:all-MiniLM-L6-v2');
     expect(sql).toContain('vector(384)');
     expect(sql).toContain('gbrain_backup_20260531_214413.backup_manifest');
+    expect(sql).toContain("SELECT 'embedded_chunks', count(*) FROM public.content_chunks WHERE embedding IS NOT NULL");
+    expect(sql).toContain("SELECT 'sources', count(*) FROM public.sources");
+    expect(sql).toContain("SELECT 'facts', count(*) FROM public.facts");
+    expect(sql).toContain('FROM gbrain_backup_20260531_214413.content_chunks');
     expect(sql).not.toContain("SELECT 'mcp_request_log', count(*) FROM public.mcp_request_log");
   });
 

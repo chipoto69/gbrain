@@ -81,6 +81,7 @@ describe('rudy remote MCP readiness', () => {
   test('detects successful tool calls without parsing private content', () => {
     expect(hasSuccessfulToolCall([{ result: { content: [{ type: 'text', text: 'private' }] } }])).toBe(true);
     expect(hasSuccessfulToolCall([{ error: { message: 'nope' } }])).toBe(false);
+    expect(hasSuccessfulToolCall([{ result: { isError: true, content: [{ type: 'text', text: 'failed' }] } }])).toBe(false);
   });
 
   test('sends initialized notification and follows tools/list pagination', async () => {
@@ -158,6 +159,62 @@ describe('rudy remote MCP readiness', () => {
         'tools/call',
       ]);
       expect((calls[3] as any).params).toEqual({ cursor: 'page-2' });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test('does not report full readiness when a required probe returns an MCP error result', async () => {
+    const originalFetch = globalThis.fetch;
+    const tools = (await expectedRemoteToolNames()).map(name => ({ name }));
+    globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? '{}'));
+      if (body.method === 'initialize') {
+        return Response.json({
+          jsonrpc: '2.0',
+          id: body.id,
+          result: {
+            serverInfo: { name: 'gbrain', version: '0.42.1.0' },
+            capabilities: { tools: {} },
+          },
+        });
+      }
+      if (body.method === 'notifications/initialized') {
+        return new Response(null, { status: 204 });
+      }
+      if (body.method === 'tools/list') {
+        return Response.json({
+          jsonrpc: '2.0',
+          id: body.id,
+          result: { tools },
+        });
+      }
+      if (body.method === 'tools/call' && body.params?.name === 'get_stats') {
+        return Response.json({
+          jsonrpc: '2.0',
+          id: body.id,
+          result: { content: [{ type: 'text', text: '{}' }] },
+        });
+      }
+      if (body.method === 'tools/call' && body.params?.name === 'get_health') {
+        return Response.json({
+          jsonrpc: '2.0',
+          id: body.id,
+          result: { isError: true, content: [{ type: 'text', text: 'unhealthy' }] },
+        });
+      }
+      return Response.json({ error: { message: 'unexpected' } }, { status: 500 });
+    }) as typeof fetch;
+
+    try {
+      const report = await buildReadinessReport(
+        { url: 'https://example.invalid/mcp', token: 'secret', source: 'test' },
+        { requiredTools: [...DEFAULT_REQUIRED_TOOLS], timeoutMs: 1_000 },
+      );
+      expect(report.full_surface_ready).toBe(true);
+      expect(report.stats_ok).toBe(true);
+      expect(report.health_ok).toBe(false);
+      expect(report.status).toBe('not_ready');
     } finally {
       globalThis.fetch = originalFetch;
     }

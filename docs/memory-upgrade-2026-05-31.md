@@ -1,17 +1,17 @@
-# Rudy GBrain Memory Upgrade Notes 2026-05-31
+# GBrain Memory Upgrade Notes 2026-05-31
 
 ## Canonical repositories
 
 - `garrytan/gbrain` is the canonical code upstream.
-- `chipoto69/gbrain` is Rudy's fork/integration remote and is behind upstream.
-- `chipoto69/brain` is the private markdown canon repo. It is not a fork of
+- `chipoto69/gbrain` is the integration fork remote and is behind upstream.
+- `chipoto69/brain` is the separate markdown canon repo. It is not a fork of
   `gbrain` and does not share Git history with it.
 
 Post-upgrade counts on 2026-05-31:
 
-- Local `/Users/rudlord/gbrain` `master` tracks `fork/master` and is upgraded
-  to the merged Rudy fork tip `3f242da2`.
-- Local `/Users/rudlord/gbrain` `master` is `3` commits ahead and `0` commits
+- Local `~/gbrain` `master` tracks `fork/master` and is upgraded
+  to the merged integration-fork tip `3f242da2`.
+- Local `~/gbrain` `master` is `3` commits ahead and `0` commits
   behind `garrytan/gbrain` `origin/master`.
 - Preservation branch `preserve/local-384-embedding-20260531` is `1` ahead and
   `213` commits behind `garrytan/gbrain` `origin/master`.
@@ -19,18 +19,18 @@ Post-upgrade counts on 2026-05-31:
   behind `garrytan/gbrain` `origin/master`.
 - `chipoto69/gbrain` PR #1 was merged into `master` with commit `3f242da2`.
 
-The three Rudy fork commits preserve the 384-dimensional embedding contract,
+The three integration-fork commits preserve the 384-dimensional embedding contract,
 add the local markdown canary, and add the remote MCP canary.
 
 ## Current local preservation
 
 Before upgrading the live memory runtime, preserve:
 
-- `/Users/rudlord/gbrain` dirty patch: local 384-dimensional MiniLM embedding
+- `~/gbrain` dirty patch: local 384-dimensional MiniLM embedding
   route and executable CLI bit.
-- `/Users/rudlord/gbrain/.worktrees/t_4573b52e`: nested clean worktree for
+- `~/gbrain/.worktrees/t_4573b52e`: nested clean worktree for
   older multi-agent hardening work.
-- `/Users/rudlord/brain`: markdown canon, currently ahead of its remote branch.
+- `~/brain`: markdown canon, currently ahead of its remote branch.
 
 The local 384-dimensional patch is represented by branch:
 
@@ -41,12 +41,12 @@ preserve/local-384-embedding-20260531
 The pre-upgrade local filesystem backup is:
 
 ```bash
-/Users/rudlord/Desktop/gbrain-preupgrade-20260531-231348
+~/Desktop/gbrain-preupgrade-20260531-231348
 ```
 
 It includes the dirty working-tree patch, an all-refs bundle for
-`/Users/rudlord/gbrain`, the nested `.worktrees/t_4573b52e` worktree archive,
-and a `/Users/rudlord/brain` working-copy backup.
+`~/gbrain`, the nested `.worktrees/t_4573b52e` worktree archive,
+and a `~/brain` working-copy backup.
 
 ## Non-negotiable live-memory invariant
 
@@ -92,7 +92,7 @@ bulk sync, or import run.
 
 ## Live Supabase backup and readiness
 
-Supabase project `dpithlomjfosidmgdopm` is the live GBrain data substrate. An
+The configured Supabase project is the live GBrain data substrate. An
 in-database backup schema was created and verified before any live migration
 attempt:
 
@@ -168,14 +168,14 @@ the supplied URL, checks the `384` embedding contract and nonempty critical
 memory tables, then exits.
 
 This wrapper writes rendered SQL files and a custom-format dump under
-`/Users/rudlord/Desktop/gbrain-live-v042-activation/` by default. It does not
+`~/Desktop/gbrain-live-v042-activation/` by default. It does not
 put the database URL on `pg_dump` or `psql` argv; it derives `PGHOST`,
 `PGDATABASE`, `PGUSER`, `PGPASSWORD`, and `PGSSLMODE` in the child environment
 instead.
 
 Current live readiness markers:
 
-- `public.config.schema_version` is still `1`.
+- `public.config.version` is still `1`.
 - `public.config.embedding_dimensions` is `384`.
 - `public.config.embedding_model` is `openai:all-MiniLM-L6-v2`.
 - `public.content_chunks.embedding` is `vector(384)`.
@@ -187,7 +187,7 @@ Current live readiness markers:
 The deployed Supabase Edge function `gbrain-mcp` is active and works for MCP
 operations through the existing bearer-token config, but its bundled
 `gbrain-core.js` reports package version `0.7.0`. That is older than the local
-v0.42.1.0 code now present in `/Users/rudlord/gbrain`.
+v0.42.1.0 code now present in `~/gbrain`.
 
 The remote MCP canary currently verifies:
 
@@ -218,7 +218,7 @@ For architecture integration, use the richer readiness probe:
 
 ```bash
 bun scripts/rudy/remote-mcp-readiness.ts \
-  --from-claude-json /Users/rudlord/.claude.json \
+  --from-claude-json ~/.claude.json \
   --server gbrain
 ```
 
@@ -229,7 +229,7 @@ that gap fail hard:
 
 ```bash
 bun scripts/rudy/remote-mcp-readiness.ts \
-  --from-claude-json /Users/rudlord/.claude.json \
+  --from-claude-json ~/.claude.json \
   --server gbrain \
   --strict-full-surface
 ```
@@ -268,7 +268,7 @@ The script starts:
 bun run src/cli.ts serve --http --port 3131 --bind 127.0.0.1 --suppress-bootstrap-token
 ```
 
-Then it reuses the existing bearer token from `/Users/rudlord/.claude.json`
+Then it reuses the existing bearer token from `~/.claude.json`
 and runs the strict full-surface readiness gate against
 `http://127.0.0.1:3131/mcp`.
 
@@ -293,14 +293,14 @@ Use the canary before any broad import:
 
 ```bash
 bun scripts/rudy/brain-md-canary.ts \
-  --file /Users/rudlord/brain/personal/agent2human-advice.md
+  --file ~/brain/example/canary-note.md
 ```
 
 After DB auth is fixed and a backup exists:
 
 ```bash
 bun scripts/rudy/brain-md-canary.ts \
-  --file /Users/rudlord/brain/personal/agent2human-advice.md \
+  --file ~/brain/example/canary-note.md \
   --execute
 ```
 
@@ -318,7 +318,7 @@ the bearer token:
 
 ```bash
 bun scripts/rudy/remote-mcp-canary.ts \
-  --from-claude-json /Users/rudlord/.claude.json \
+  --from-claude-json ~/.claude.json \
   --server gbrain
 ```
 
@@ -333,7 +333,7 @@ against the local v0.42 remote-callable HTTP tool registry:
 
 ```bash
 bun scripts/rudy/remote-mcp-readiness.ts \
-  --from-claude-json /Users/rudlord/.claude.json \
+  --from-claude-json ~/.claude.json \
   --server gbrain
 ```
 

@@ -135,22 +135,33 @@ BEGIN
   WITH counts AS (
     SELECT 'pages'::text AS table_name, count(*)::bigint AS public_count FROM public.pages UNION ALL
     SELECT 'content_chunks', count(*) FROM public.content_chunks UNION ALL
+    SELECT 'embedded_chunks', count(*) FROM public.content_chunks WHERE embedding IS NOT NULL UNION ALL
     SELECT 'links', count(*) FROM public.links UNION ALL
     SELECT 'tags', count(*) FROM public.tags UNION ALL
     SELECT 'timeline_entries', count(*) FROM public.timeline_entries UNION ALL
     SELECT 'raw_data', count(*) FROM public.raw_data UNION ALL
+    SELECT 'sources', count(*) FROM public.sources UNION ALL
+    SELECT 'facts', count(*) FROM public.facts UNION ALL
     SELECT 'ingest_log', count(*) FROM public.ingest_log UNION ALL
     SELECT 'page_versions', count(*) FROM public.page_versions UNION ALL
     SELECT 'access_tokens', count(*) FROM public.access_tokens UNION ALL
     SELECT 'oauth_clients', count(*) FROM public.oauth_clients
   ),
+  backup_counts AS (
+    SELECT table_name, row_count
+    FROM ${backupSchema}.backup_manifest
+    WHERE table_name <> 'embedded_chunks' UNION ALL
+    SELECT 'embedded_chunks'::text AS table_name, count(*)::bigint AS row_count
+    FROM ${backupSchema}.content_chunks
+    WHERE embedding IS NOT NULL
+  ),
   comparison AS (
     SELECT
       c.table_name,
       c.public_count,
-      m.row_count AS backup_count
+      b.row_count AS backup_count
     FROM counts c
-    LEFT JOIN ${backupSchema}.backup_manifest m USING (table_name)
+    LEFT JOIN backup_counts b USING (table_name)
   )
   SELECT string_agg(
            table_name || ' public=' || public_count::text || ' backup=' || coalesce(backup_count::text, 'missing'),
@@ -170,6 +181,9 @@ END $$;
 
 export function pgEnvFromDatabaseUrl(dbUrl: string): PgEnv {
   const url = new URL(dbUrl);
+  if (url.protocol !== 'postgresql:' && url.protocol !== 'postgres:') {
+    throw new Error('GBRAIN_DATABASE_URL must use a postgres:// or postgresql:// URL');
+  }
   if (!url.hostname) throw new Error('GBRAIN_DATABASE_URL is missing a host');
   const database = decodeURIComponent(url.pathname.replace(/^\//, ''));
   if (!database) throw new Error('GBRAIN_DATABASE_URL is missing a database name');

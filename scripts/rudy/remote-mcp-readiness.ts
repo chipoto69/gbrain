@@ -110,6 +110,7 @@ export function hasSuccessfulToolCall(payloads: unknown[]): boolean {
   return payloads.some(payload => {
     const p = payload as any;
     if (p?.error) return false;
+    if (p?.result?.isError === true) return false;
     return Boolean(p?.result);
   });
 }
@@ -274,9 +275,10 @@ export async function buildReadinessReport(
     healthOk = false;
   }
 
-  const status = comparison.full_surface_ready
+  const probesOk = statsOk && healthOk;
+  const status = comparison.full_surface_ready && probesOk
     ? 'full'
-    : comparison.core_ready && statsOk
+    : comparison.core_ready && probesOk
       ? 'limited'
       : 'not_ready';
   return {

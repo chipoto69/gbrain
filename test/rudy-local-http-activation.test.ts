@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { spawn } from 'node:child_process';
 import {
   buildPlan,
   buildServeEnv,
@@ -7,6 +8,7 @@ import {
   dbUrlSource,
   localMcpUrl,
   redactDbUrl,
+  waitForChildExit,
 } from '../scripts/rudy/local-http-activation.ts';
 
 describe('rudy local HTTP activation', () => {
@@ -77,6 +79,12 @@ describe('rudy local HTTP activation', () => {
     expect(childExitCode(null, 'SIGTERM')).toBe(0);
     expect(childExitCode(null, 'SIGSEGV')).toBe(1);
     expect(childExitCode(null, null)).toBe(1);
+  });
+
+  test('returns the exit code for a child that exited before the wait listener attaches', async () => {
+    const child = spawn(process.execPath, ['-e', 'process.exit(7)'], { stdio: 'ignore' });
+    await new Promise(resolve => child.once('exit', resolve));
+    expect(await waitForChildExit(child)).toBe(7);
   });
 
   test('passes database URL env through to the local serve child', () => {

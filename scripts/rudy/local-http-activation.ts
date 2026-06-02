@@ -98,9 +98,12 @@ async function waitForHealth(
   const deadline = Date.now() + timeoutMs;
   let lastError = '';
   while (Date.now() < deadline) {
-    if (child.exitCode !== null) {
+    if (child.exitCode !== null || child.signalCode !== null) {
       const tail = stderrTail().trim();
-      throw new Error(`gbrain serve exited early with code ${child.exitCode}${tail ? `\n--- stderr tail ---\n${tail}` : ''}`);
+      const reason = child.exitCode !== null
+        ? `code ${child.exitCode}`
+        : `signal ${child.signalCode}`;
+      throw new Error(`gbrain serve exited early with ${reason}${tail ? `\n--- stderr tail ---\n${tail}` : ''}`);
     }
     try {
       const res = await fetch(healthUrl);
@@ -203,7 +206,10 @@ export function buildServeEnv(
   };
 }
 
-async function waitForChildExit(child: ChildProcess): Promise<number> {
+export async function waitForChildExit(child: ChildProcess): Promise<number> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return childExitCode(child.exitCode, child.signalCode);
+  }
   return await new Promise(resolve => {
     child.once('exit', (code, signal) => {
       resolve(childExitCode(code, signal));
@@ -295,8 +301,9 @@ if (import.meta.main) {
       local_http: true,
       execution_mode: cli.keepAlive ? 'keep-alive' : 'verify-and-stop',
     }, null, 2));
-    if (!report.full_surface_ready) process.exitCode = 2;
-    if (cli.keepAlive && report.full_surface_ready) {
+    const activationReady = report.status === 'full';
+    if (!activationReady) process.exitCode = 2;
+    if (cli.keepAlive && activationReady) {
       console.error(`GBrain local HTTP MCP is ready at ${url}; press Ctrl-C to stop.`);
       const cleanup = installSignalForwarding(child);
       try {
