@@ -1,0 +1,140 @@
+import { describe, expect, test } from 'bun:test';
+import {
+  backupSchemaFromDate,
+  buildLocalActivationArgs,
+  buildPlan,
+  buildReadinessAssertionSql,
+  dbPreflightSqlFile,
+  localActivationScriptFile,
+  pgEnvFromDatabaseUrl,
+  renderSqlTemplate,
+  validateBackupSchemaName,
+} from '../scripts/rudy/live-v042-activation.ts';
+
+describe('rudy live v0.42 activation', () => {
+  test('builds timestamped backup schema names', () => {
+    expect(backupSchemaFromDate(new Date(Date.UTC(2026, 4, 31, 21, 44, 13))))
+      .toBe('gbrain_backup_20260531_214413');
+  });
+
+  test('validates backup schema names', () => {
+    expect(validateBackupSchemaName('gbrain_backup_20260531_214413')).toBe('gbrain_backup_20260531_214413');
+    expect(() => validateBackupSchemaName('public;drop schema public')).toThrow('Invalid backup schema');
+  });
+
+  test('renders SQL templates with the validated backup schema', () => {
+    const sql = renderSqlTemplate(
+      'CREATE SCHEMA gbrain_backup_YYYYMMDD_HHMMSS; SELECT * FROM gbrain_backup_YYYYMMDD_HHMMSS.backup_manifest;',
+      'gbrain_backup_20260531_214413',
+    );
+    expect(sql).toContain('CREATE SCHEMA gbrain_backup_20260531_214413');
+    expect(sql).not.toContain('YYYYMMDD');
+  });
+
+  test('parses database URL into pg env without requiring argv secrets', () => {
+    const env = pgEnvFromDatabaseUrl('postgresql://postgres.ref:p%40ss@aws-0.example.pooler.supabase.com:6543/postgres?sslmode=require');
+    expect(env).toEqual({
+      PGHOST: 'aws-0.example.pooler.supabase.com',
+      PGPORT: '6543',
+      PGDATABASE: 'postgres',
+      PGUSER: 'postgres.ref',
+      PGPASSWORD: 'p@ss',
+      PGSSLMODE: 'require',
+    });
+  });
+
+  test('rejects non-Postgres database URL protocols', () => {
+    expect(() => pgEnvFromDatabaseUrl('https://example.com/postgres')).toThrow('postgres:// or postgresql://');
+  });
+
+  test('plans without leaking database URL credentials', () => {
+    const plan = buildPlan({
+      dbUrl: 'postgresql://postgres:secret@example.com:6543/postgres?sslmode=require',
+      backupSchema: 'gbrain_backup_20260531_214413',
+      backupDir: '/tmp/gbrain-backup',
+      port: 3131,
+      bind: '127.0.0.1',
+      claudeJson: '/Users/rudlord/.claude.json',
+      server: 'gbrain',
+      timeoutMs: 30_000,
+    });
+    expect(plan.has_required_db_url).toBe(true);
+    expect(plan.execution_mode).toBe('backup-readiness-and-serve');
+    expect(plan.env_preview?.PGPASSWORD).toBe('[REDACTED]');
+    expect(plan.commands.psql_preflight).toEqual(['psql', '-X', '--no-psqlrc', '--set', 'ON_ERROR_STOP=1', '--file', dbPreflightSqlFile()]);
+    expect(JSON.stringify(plan.commands)).not.toContain('secret');
+    expect(plan.commands.local_activation).toContain('--keep-alive');
+  });
+
+  test('plans a read-only DB credential preflight without backup side effects', () => {
+    const plan = buildPlan({
+      dbUrl: 'postgresql://postgres:secret@example.com:6543/postgres?sslmode=require',
+      backupSchema: 'gbrain_backup_20260531_214413',
+      backupDir: '/tmp/gbrain-backup',
+      port: 3131,
+      bind: '127.0.0.1',
+      claudeJson: '/Users/rudlord/.claude.json',
+      server: 'gbrain',
+      timeoutMs: 30_000,
+      preflightOnly: true,
+    });
+    expect(plan.execution_mode).toBe('preflight-only');
+    expect(plan.preflight_sql_file).toBe(dbPreflightSqlFile());
+    expect(plan.commands.psql_preflight).toContain(plan.preflight_sql_file);
+    expect(JSON.stringify(plan.commands.psql_preflight)).not.toContain('secret');
+  });
+
+  test('warns when the required GBRAIN_DATABASE_URL is absent', () => {
+    const plan = buildPlan({
+      backupSchema: 'gbrain_backup_20260531_214413',
+      backupDir: '/tmp/gbrain-backup',
+      port: 3131,
+      bind: '127.0.0.1',
+      claudeJson: '/Users/rudlord/.claude.json',
+      server: 'gbrain',
+      timeoutMs: 30_000,
+    });
+    expect(plan.has_required_db_url).toBe(false);
+    expect(plan.warning).toContain('GBRAIN_DATABASE_URL');
+  });
+
+  test('readiness assertion pins 384-dimensional live memory invariants', () => {
+    const sql = buildReadinessAssertionSql('gbrain_backup_20260531_214413');
+    expect(sql).toContain('embedding_dimensions');
+    expect(sql).toContain('openai:all-MiniLM-L6-v2');
+    expect(sql).toContain('vector(384)');
+    expect(sql).toContain('gbrain_backup_20260531_214413.backup_manifest');
+    expect(sql).toContain("SELECT 'embedded_chunks', count(*) FROM public.content_chunks WHERE embedding IS NOT NULL");
+    expect(sql).toContain("SELECT 'sources', count(*) FROM public.sources");
+    expect(sql).toContain("SELECT 'facts', count(*) FROM public.facts");
+    expect(sql).toContain('FROM gbrain_backup_20260531_214413.content_chunks');
+    expect(sql).not.toContain("SELECT 'mcp_request_log', count(*) FROM public.mcp_request_log");
+  });
+
+  test('local activation args delegate to keep-alive activation gate', () => {
+    const scriptFile = localActivationScriptFile();
+    expect(scriptFile.endsWith('/scripts/rudy/local-http-activation.ts')).toBe(true);
+    expect(scriptFile.startsWith('/')).toBe(true);
+    expect(buildLocalActivationArgs({
+      port: 3131,
+      bind: '127.0.0.1',
+      claudeJson: '/Users/rudlord/.claude.json',
+      server: 'gbrain',
+      timeoutMs: 30_000,
+    })).toEqual([
+      scriptFile,
+      '--execute',
+      '--keep-alive',
+      '--port',
+      '3131',
+      '--bind',
+      '127.0.0.1',
+      '--from-claude-json',
+      '/Users/rudlord/.claude.json',
+      '--server',
+      'gbrain',
+      '--timeout-ms',
+      '30000',
+    ]);
+  });
+});
